@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"regexp"
 
-	"github.com/antonmedv/expr/internal/file"
+	"github.com/antonmedv/expr/file"
 )
 
 type Program struct {
 	Source    *file.Source
-	Locations []file.Location
+	Locations map[int]file.Location
 	Constants []interface{}
 	Bytecode  []byte
 }
@@ -174,6 +174,9 @@ func (program *Program) Disassemble() string {
 
 		case OpCall:
 			constant("OpCall")
+
+		case OpCallFast:
+			constant("OpCallFast")
 
 		case OpMethod:
 			constant("OpMethod")

@@ -2,6 +2,11 @@ package main
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/antonmedv/expr/checker"
 	"github.com/antonmedv/expr/compiler"
 	"github.com/antonmedv/expr/optimizer"
@@ -10,10 +15,6 @@ import (
 	"github.com/gdamore/tcell"
 	"github.com/rivo/tview"
 	"github.com/sanity-io/litter"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
 )
 
 func debugger() {
@@ -24,7 +25,8 @@ func debugger() {
 	check(err)
 
 	if opt {
-		optimizer.Optimize(&tree.Node)
+		err = optimizer.Optimize(&tree.Node, nil)
+		check(err)
 	}
 
 	program, err := compiler.Compile(tree, nil)
@@ -147,8 +149,8 @@ func debugger() {
 	autostep := false
 	var breakpoint int
 
-	draw(0)
 	go func() {
+		draw(0)
 		for ip := range vm.Position() {
 			draw(ip)
 

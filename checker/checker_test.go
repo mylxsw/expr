@@ -2,14 +2,13 @@ package checker_test
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/antonmedv/expr"
 	"github.com/antonmedv/expr/checker"
-	"github.com/antonmedv/expr/internal/conf"
+	"github.com/antonmedv/expr/conf"
 	"github.com/antonmedv/expr/parser"
 	"github.com/stretchr/testify/assert"
 )
@@ -86,70 +85,6 @@ func TestVisitor_BuiltinNode(t *testing.T) {
 	}
 }
 
-func TestCheck_AsBool(t *testing.T) {
-	input := `1+2`
-
-	tree, err := parser.Parse(input)
-	assert.NoError(t, err)
-
-	config := &conf.Config{}
-	expr.AsBool()(config)
-
-	_, err = checker.Check(tree, config)
-	assert.Error(t, err)
-	assert.Equal(t, "expected bool, but got int", err.Error())
-}
-
-// Helper types and declarations.
-
-type mockEnv struct {
-	*mockEmbed
-	Add       func(int64) int64
-	Any       interface{}
-	Var       *mockVar
-	Tickets   []mockTicket
-	Duration  time.Duration
-	Interface mockInterface
-}
-
-func (f *mockEnv) Set(v int64, any interface{}) int64 {
-	return v
-}
-
-type mockEmbed struct {
-	EmbedVar int64
-	Sub      func(int64) int64
-}
-
-func (f *mockEmbed) Get() int64 {
-	return 0
-}
-
-type mockVar struct {
-	*mockEmbed
-	Add func(int64) int64
-	Any interface{}
-}
-
-func (*mockVar) Set(v int64, f float64) int64 {
-	return 0
-}
-
-type mockInterface interface {
-	Method(int) int
-}
-
-type mockTicket struct {
-	Price  int
-	Origin string
-}
-
-func (t mockTicket) Method(int) int {
-	return 0
-}
-
-// Other tests.
-
 func TestCheck(t *testing.T) {
 	var typeTests = []string{
 		"!Bool",
@@ -220,6 +155,11 @@ func TestCheck(t *testing.T) {
 		"true ? Any : Any",
 		"{id: Foo.Bar.Baz, 'str': Bool}",
 		`"a" < "b"`,
+		"Variadic('', 1, 2) + Variadic('')",
+		"Foo.Variadic('', 1, 2) + Foo.Variadic('')",
+		"count(1..30, {# % 3 == 0}) > 0",
+		"map(1..3, {#}) == [1,2,3]",
+		"map(filter(ArrayOfFoo, {.Int64 > 0}), {.Bar})",
 	}
 	for _, test := range typeTests {
 		var err error
@@ -232,223 +172,319 @@ func TestCheck(t *testing.T) {
 	}
 }
 
+const errorTests = `
+Foo.Bar.Not
+type checker_test.bar has no field Not (1:9)
+ | Foo.Bar.Not
+ | ........^
+
+Noo
+unknown name Noo (1:1)
+ | Noo
+ | ^
+
+Foo()
+unknown func Foo (1:1)
+ | Foo()
+ | ^
+
+Foo['string']
+invalid operation: type *checker_test.foo does not support indexing (1:4)
+ | Foo['string']
+ | ...^
+
+Foo.Fn(Not)
+too many arguments to call Fn (1:5)
+ | Foo.Fn(Not)
+ | ....^
+
+Foo.Bar()
+type *checker_test.foo has no method Bar (1:5)
+ | Foo.Bar()
+ | ....^
+
+Foo.Bar.Not()
+type checker_test.bar has no method Not (1:9)
+ | Foo.Bar.Not()
+ | ........^
+
+ArrayOfFoo[0].Not
+type *checker_test.foo has no field Not (1:15)
+ | ArrayOfFoo[0].Not
+ | ..............^
+
+ArrayOfFoo[Not]
+unknown name Not (1:12)
+ | ArrayOfFoo[Not]
+ | ...........^
+
+Not[0]
+unknown name Not (1:1)
+ | Not[0]
+ | ^
+
+Not.Bar
+unknown name Not (1:1)
+ | Not.Bar
+ | ^
+
+ArrayOfFoo.Not
+type []*checker_test.foo has no field Not (1:12)
+ | ArrayOfFoo.Not
+ | ...........^
+
+Fn(Not)
+not enough arguments to call Fn (1:1)
+ | Fn(Not)
+ | ^
+
+Map['str'].Not
+type *checker_test.foo has no field Not (1:12)
+ | Map['str'].Not
+ | ...........^
+
+Bool && IntPtr
+invalid operation: && (mismatched types bool and *int) (1:6)
+ | Bool && IntPtr
+ | .....^
+
+No ? Any.Bool : Any.Not
+unknown name No (1:1)
+ | No ? Any.Bool : Any.Not
+ | ^
+
+Any.Cond ? No : Any.Not
+unknown name No (1:12)
+ | Any.Cond ? No : Any.Not
+ | ...........^
+
+Any.Cond ? Any.Bool : No
+unknown name No (1:23)
+ | Any.Cond ? Any.Bool : No
+ | ......................^
+
+ManOfAny ? Any : Any
+non-bool expression (type map[string]interface {}) used as condition (1:1)
+ | ManOfAny ? Any : Any
+ | ^
+
+String matches Int
+invalid operation: matches (mismatched types string and int) (1:8)
+ | String matches Int
+ | .......^
+
+Int matches String
+invalid operation: matches (mismatched types int and string) (1:5)
+ | Int matches String
+ | ....^
+
+String contains Int
+invalid operation: contains (mismatched types string and int) (1:8)
+ | String contains Int
+ | .......^
+
+Int contains String
+invalid operation: contains (mismatched types int and string) (1:5)
+ | Int contains String
+ | ....^
+
+!Not
+unknown name Not (1:2)
+ | !Not
+ | .^
+
+Not == Any
+unknown name Not (1:1)
+ | Not == Any
+ | ^
+
+[Not]
+unknown name Not (1:2)
+ | [Not]
+ | .^
+
+{id: Not}
+unknown name Not (1:6)
+ | {id: Not}
+ | .....^
+
+(nil).Foo
+type <nil> has no field Foo (1:7)
+ | (nil).Foo
+ | ......^
+
+(nil)['Foo']
+invalid operation: type <nil> does not support indexing (1:6)
+ | (nil)['Foo']
+ | .....^
+
+1 and false
+invalid operation: and (mismatched types int and bool) (1:3)
+ | 1 and false
+ | ..^
+
+true or 0
+invalid operation: or (mismatched types bool and int) (1:6)
+ | true or 0
+ | .....^
+
+not IntPtr
+invalid operation: not (mismatched type *int) (1:1)
+ | not IntPtr
+ | ^
+
+len(Not)
+unknown name Not (1:5)
+ | len(Not)
+ | ....^
+
+Int < Bool
+invalid operation: < (mismatched types int and bool) (1:5)
+ | Int < Bool
+ | ....^
+
+Int > Bool
+invalid operation: > (mismatched types int and bool) (1:5)
+ | Int > Bool
+ | ....^
+
+Int >= Bool
+invalid operation: >= (mismatched types int and bool) (1:5)
+ | Int >= Bool
+ | ....^
+
+Int <= Bool
+invalid operation: <= (mismatched types int and bool) (1:5)
+ | Int <= Bool
+ | ....^
+
+Int + Bool
+invalid operation: + (mismatched types int and bool) (1:5)
+ | Int + Bool
+ | ....^
+
+Int - Bool
+invalid operation: - (mismatched types int and bool) (1:5)
+ | Int - Bool
+ | ....^
+
+Int * Bool
+invalid operation: * (mismatched types int and bool) (1:5)
+ | Int * Bool
+ | ....^
+
+Int / Bool
+invalid operation: / (mismatched types int and bool) (1:5)
+ | Int / Bool
+ | ....^
+
+Int % Bool
+invalid operation: % (mismatched types int and bool) (1:5)
+ | Int % Bool
+ | ....^
+
+Int ** Bool
+invalid operation: ** (mismatched types int and bool) (1:5)
+ | Int ** Bool
+ | ....^
+
+Int .. Bool
+invalid operation: .. (mismatched types int and bool) (1:5)
+ | Int .. Bool
+ | ....^
+
+NilFn() and BoolFn()
+func NilFn doesn't return value (1:1)
+ | NilFn() and BoolFn()
+ | ^
+
+'str' in String
+invalid operation: in (mismatched types string and string) (1:7)
+ | 'str' in String
+ | ......^
+
+1 in Foo
+invalid operation: in (mismatched types int and *checker_test.foo) (1:3)
+ | 1 in Foo
+ | ..^
+
+1 + ''
+invalid operation: + (mismatched types int and string) (1:3)
+ | 1 + ''
+ | ..^
+
+all(ArrayOfFoo, {#.Fn() < 0})
+invalid operation: < (mismatched types bool and int) (1:25)
+ | all(ArrayOfFoo, {#.Fn() < 0})
+ | ........................^
+
+map(Any, {0})[0] + "str"
+invalid operation: + (mismatched types int and string) (1:18)
+ | map(Any, {0})[0] + "str"
+ | .................^
+
+Variadic()
+not enough arguments to call Variadic (1:1)
+ | Variadic()
+ | ^
+
+Variadic('', '')
+cannot use string as argument (type int) to call Variadic  (1:14)
+ | Variadic('', '')
+ | .............^
+
+Foo.Variadic()
+not enough arguments to call Variadic (1:5)
+ | Foo.Variadic()
+ | ....^
+
+Foo.Variadic('', '')
+cannot use string as argument (type int) to call Variadic  (1:18)
+ | Foo.Variadic('', '')
+ | .................^
+
+count(1, {#})
+builtin count takes only array (got int) (1:7)
+ | count(1, {#})
+ | ......^
+
+count(ArrayOfInt, {#})
+closure should return boolean (got int) (1:19)
+ | count(ArrayOfInt, {#})
+ | ..................^
+
+all(ArrayOfInt, {# + 1})
+closure should return boolean (got int) (1:17)
+ | all(ArrayOfInt, {# + 1})
+ | ................^
+
+filter(ArrayOfFoo, {.Int64})
+closure should return boolean (got int64) (1:20)
+ | filter(ArrayOfFoo, {.Int64})
+ | ...................^
+
+map(1, {2})
+builtin map takes only array (got int) (1:5)
+ | map(1, {2})
+ | ....^
+
+map(filter(ArrayOfFoo, {.Int64 > 0}), {.Var})
+type *checker_test.foo has no field Var (1:41)
+ | map(filter(ArrayOfFoo, {.Int64 > 0}), {.Var})
+ | ........................................^
+`
+
 func TestCheck_error(t *testing.T) {
-	type test struct {
-		input string
-		err   string
-	}
-	var typeErrorTests = []test{
-		{
-			"Foo.Bar.Not",
-			"type checker_test.bar has no field Not",
-		},
-		{
-			"Noo",
-			"unknown name Noo",
-		},
-		{
-			"Noo()",
-			"unknown func Noo",
-		},
-		{
-			"Foo()",
-			"unknown func Foo",
-		},
-		{
-			"Foo['string']",
-			`invalid operation: type *checker_test.foo does not support indexing`,
-		},
-		{
-			"Foo.Fn(Not)",
-			"too many arguments to call Fn",
-		},
-		{
-			"Foo.Bar()",
-			"type *checker_test.foo has no method Bar",
-		},
-		{
-			"Foo.Bar.Not()",
-			"type checker_test.bar has no method Not",
-		},
-		{
-			"ArrayOfFoo[0].Not",
-			"type *checker_test.foo has no field Not",
-		},
-		{
-			"ArrayOfFoo[Not]",
-			"unknown name Not",
-		},
-		{
-			"Not[0]",
-			"unknown name Not",
-		},
-		{
-			"Not.Bar",
-			"unknown name Not",
-		},
-		{
-			"ArrayOfFoo.Not",
-			"type []*checker_test.foo has no field Not",
-		},
-		{
-			"Fn(Not)",
-			"not enough arguments to call Fn",
-		},
-		{
-			"Map['str'].Not",
-			`type *checker_test.foo has no field Not`,
-		},
-		{
-			"Bool && IntPtr",
-			"invalid operation: && (mismatched types bool and *int)",
-		},
-		{
-			"No ? Any.Bool : Any.Not",
-			"unknown name No",
-		},
-		{
-			"Any.Cond ? No : Any.Not",
-			"unknown name No",
-		},
-		{
-			"Any.Cond ? Any.Bool : No",
-			"unknown name No",
-		},
-		{
-			"ManOfAny ? Any : Any",
-			"non-bool expression (type map[string]interface {}) used as condition",
-		},
-		{
-			"String matches Int",
-			"invalid operation: matches (mismatched types string and int)",
-		},
-		{
-			"Int matches String",
-			"invalid operation: matches (mismatched types int and string)",
-		},
-		{
-			"String contains Int",
-			"invalid operation: contains (mismatched types string and int)",
-		},
-		{
-			"Int contains String",
-			"invalid operation: contains (mismatched types int and string)",
-		},
-		{
-			"!Not",
-			"unknown name Not",
-		},
-		{
-			"Not == Any",
-			"unknown name Not",
-		},
-		{
-			"[Not]",
-			"unknown name Not",
-		},
-		{
-			"{id: Not}",
-			"unknown name Not",
-		},
-		{
-			"(nil).Foo",
-			"type <nil> has no field Foo",
-		},
-		{
-			"(nil)['Foo']",
-			`invalid operation: type <nil> does not support indexing`,
-		},
-		{
-			"1 and false",
-			"invalid operation: and (mismatched types int and bool)",
-		},
-		{
-			"true or 0",
-			"invalid operation: or (mismatched types bool and int)",
-		},
-		{
-			"not IntPtr",
-			"invalid operation: not (mismatched type *int)",
-		},
-		{
-			"len(Not)",
-			"unknown name Not",
-		},
-		{
-			"Int < Bool",
-			"invalid operation: < (mismatched types int and bool)",
-		},
-		{
-			"Int > Bool",
-			"invalid operation: > (mismatched types int and bool)",
-		},
-		{
-			"Int >= Bool",
-			"invalid operation: >= (mismatched types int and bool)",
-		},
-		{
-			"Int <= Bool",
-			"invalid operation: <= (mismatched types int and bool)",
-		},
-		{
-			"Int + Bool",
-			"invalid operation: + (mismatched types int and bool)",
-		},
-		{
-			"Int - Bool",
-			"invalid operation: - (mismatched types int and bool)",
-		},
-		{
-			"Int * Bool",
-			"invalid operation: * (mismatched types int and bool)",
-		},
-		{
-			"Int / Bool",
-			"invalid operation: / (mismatched types int and bool)",
-		},
-		{
-			"Int % Bool",
-			"invalid operation: % (mismatched types int and bool)",
-		},
-		{
-			"Int ** Bool",
-			"invalid operation: ** (mismatched types int and bool)",
-		},
-		{
-			"Int .. Bool",
-			"invalid operation: .. (mismatched types int and bool)",
-		},
-		{
-			"NilFn() and BoolFn()",
-			"func NilFn doesn't return value",
-		},
-		{
-			"'str' in String",
-			`invalid operation: in (mismatched types string and string)`,
-		},
-		{
-			"1 in Foo",
-			"invalid operation: in (mismatched types int and *checker_test.foo)",
-		},
-		{
-			"1 + ''",
-			`invalid operation: + (mismatched types int and string)`,
-		},
-		{
-			`all(ArrayOfFoo, {#.Fn() < 0})`,
-			`invalid operation: < (mismatched types bool and int)`,
-		},
-		{
-			`map(Any, {0})[0] + "str"`,
-			`invalid operation: + (mismatched types int and string)`,
-		},
-	}
+	tests := strings.Split(strings.Trim(errorTests, "\n"), "\n\n")
 
-	re, _ := regexp.Compile(`\s*\(\d+:\d+\)\s*`)
+	for _, test := range tests {
+		input := strings.SplitN(test, "\n", 2)
+		if len(input) != 2 {
+			t.Errorf("syntax error in test: %q", test)
+			break
+		}
 
-	for _, test := range typeErrorTests {
-
-		tree, err := parser.Parse(test.input)
+		tree, err := parser.Parse(input[0])
 		assert.NoError(t, err)
 
 		_, err = checker.Check(tree, conf.New(mockEnv2{}))
@@ -456,15 +492,73 @@ func TestCheck_error(t *testing.T) {
 			err = fmt.Errorf("<nil>")
 		}
 
-		// Trim code snippet.
-		lines := strings.Split(err.Error(), "\n")
-		firstLine := string(re.ReplaceAll([]byte(lines[0]), []byte{}))
-
-		assert.Equal(t, test.err, firstLine, test.input)
+		assert.Equal(t, input[1], err.Error(), input[0])
 	}
 }
 
-// Other helper types.
+func TestCheck_AsBool(t *testing.T) {
+	input := `1+2`
+
+	tree, err := parser.Parse(input)
+	assert.NoError(t, err)
+
+	config := &conf.Config{}
+	expr.AsBool()(config)
+
+	_, err = checker.Check(tree, config)
+	assert.Error(t, err)
+	assert.Equal(t, "expected bool, but got int", err.Error())
+}
+
+//
+// Mock types
+//
+
+type mockEnv struct {
+	*mockEmbed
+	Add       func(int64) int64
+	Any       interface{}
+	Var       *mockVar
+	Tickets   []mockTicket
+	Duration  time.Duration
+	Interface mockInterface
+}
+
+func (f *mockEnv) Set(v int64, any interface{}) int64 {
+	return v
+}
+
+type mockEmbed struct {
+	EmbedVar int64
+	Sub      func(int64) int64
+}
+
+func (f *mockEmbed) Get() int64 {
+	return 0
+}
+
+type mockVar struct {
+	*mockEmbed
+	Add func(int64) int64
+	Any interface{}
+}
+
+func (*mockVar) Set(v int64, f float64) int64 {
+	return 0
+}
+
+type mockInterface interface {
+	Method(int) int
+}
+
+type mockTicket struct {
+	Price  int
+	Origin string
+}
+
+func (t mockTicket) Method(int) int {
+	return 0
+}
 
 type abc interface {
 	Abc()
@@ -475,10 +569,11 @@ type bar struct {
 }
 
 type foo struct {
-	Int64 int64
-	Bar   bar
-	Fn    func() bool
-	Abc   abc
+	Int64    int64
+	Bar      bar
+	Fn       func() bool
+	Abc      abc
+	Variadic func(head string, xs ...int) int
 }
 
 type SubSub struct {
@@ -507,6 +602,7 @@ type mockEnv2 struct {
 	Map        map[string]*foo
 	Any        interface{}
 	ArrayOfAny []interface{}
+	ArrayOfInt []int
 	ManOfAny   map[string]interface{}
 	Fn         func(bool, int, string, interface{}) string
 	Bool       bool
@@ -521,6 +617,7 @@ type mockEnv2 struct {
 	Foo2p      **foo
 	BoolFn     func() bool
 	NilFn      func()
+	Variadic   func(head string, xs ...int) int
 }
 
 func (p mockEnv2) Method(_ bar) int {

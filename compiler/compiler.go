@@ -7,8 +7,8 @@ import (
 	"reflect"
 
 	"github.com/antonmedv/expr/ast"
-	"github.com/antonmedv/expr/internal/conf"
-	"github.com/antonmedv/expr/internal/file"
+	"github.com/antonmedv/expr/conf"
+	"github.com/antonmedv/expr/file"
 	"github.com/antonmedv/expr/parser"
 	. "github.com/antonmedv/expr/vm"
 )
@@ -21,8 +21,10 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
 	}()
 
 	c := &compiler{
-		index: make(map[interface{}]uint16),
+		index:     make(map[interface{}]uint16),
+		locations: make(map[int]file.Location),
 	}
+
 	if config != nil {
 		c.mapEnv = config.MapEnv
 		c.cast = config.Expect
@@ -47,13 +49,13 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
 }
 
 type compiler struct {
-	locations   []file.Location
-	constants   []interface{}
-	bytecode    []byte
-	index       map[interface{}]uint16
-	mapEnv      bool
-	cast        reflect.Kind
-	currentNode ast.Node
+	locations map[int]file.Location
+	constants []interface{}
+	bytecode  []byte
+	index     map[interface{}]uint16
+	mapEnv    bool
+	cast      reflect.Kind
+	nodes     []ast.Node
 }
 
 func (c *compiler) emit(op byte, b ...byte) int {
@@ -61,9 +63,11 @@ func (c *compiler) emit(op byte, b ...byte) int {
 	current := len(c.bytecode)
 	c.bytecode = append(c.bytecode, b...)
 
-	for i := 0; i < 1+len(b); i++ {
-		c.locations = append(c.locations, c.currentNode.GetLocation())
+	var loc file.Location
+	if len(c.nodes) > 0 {
+		loc = c.nodes[len(c.nodes)-1].Location()
 	}
+	c.locations[current-1] = loc
 
 	return current
 }
@@ -113,7 +117,11 @@ func (c *compiler) calcBackwardJump(to int) []byte {
 }
 
 func (c *compiler) compile(node ast.Node) {
-	c.currentNode = node
+	c.nodes = append(c.nodes, node)
+	defer func() {
+		c.nodes = c.nodes[:len(c.nodes)-1]
+	}()
+
 	switch n := node.(type) {
 	case *ast.NilNode:
 		c.NilNode(n)
@@ -178,7 +186,7 @@ func (c *compiler) IdentifierNode(node *ast.IdentifierNode) {
 }
 
 func (c *compiler) IntegerNode(node *ast.IntegerNode) {
-	t := node.GetType()
+	t := node.Type()
 	if t == nil {
 		c.emitPush(node.Value)
 		return
@@ -213,7 +221,7 @@ func (c *compiler) IntegerNode(node *ast.IntegerNode) {
 		c.emitPush(uint64(node.Value))
 
 	default:
-		panic(fmt.Sprintf("cannot compile %v to %v", node.Value, node.GetType()))
+		c.emitPush(node.Value)
 	}
 }
 
@@ -429,12 +437,11 @@ func (c *compiler) FunctionNode(node *ast.FunctionNode) {
 	for _, arg := range node.Arguments {
 		c.compile(arg)
 	}
-	c.emit(OpCall, c.makeConstant(
-		Call{
-			Name: node.Name,
-			Size: len(node.Arguments),
-		})...,
-	)
+	op := OpCall
+	if node.Fast {
+		op = OpCallFast
+	}
+	c.emit(op, c.makeConstant(Call{Name: node.Name, Size: len(node.Arguments)})...)
 }
 
 func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
@@ -531,6 +538,21 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 		c.emit(OpLoad, size...)
 		c.emit(OpEnd)
 		c.emit(OpArray)
+
+	case "count":
+		count := c.makeConstant("count")
+		c.compile(node.Arguments[0])
+		c.emit(OpBegin)
+		c.emitPush(0)
+		c.emit(OpStore, count...)
+		c.emitLoop(func() {
+			c.compile(node.Arguments[1])
+			c.emitCond(func() {
+				c.emit(OpInc, count...)
+			})
+		})
+		c.emit(OpLoad, count...)
+		c.emit(OpEnd)
 
 	default:
 		panic(fmt.Sprintf("unknown builtin %v", node.Name))
@@ -633,7 +655,7 @@ func encode(i uint16) []byte {
 }
 
 func kind(node ast.Node) reflect.Kind {
-	t := node.GetType()
+	t := node.Type()
 	if t == nil {
 		return reflect.Invalid
 	}

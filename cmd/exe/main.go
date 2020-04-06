@@ -4,40 +4,45 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"github.com/antonmedv/expr/ast"
+	"io/ioutil"
+	"os"
+
 	"github.com/antonmedv/expr"
 	"github.com/antonmedv/expr/checker"
 	"github.com/antonmedv/expr/compiler"
 	"github.com/antonmedv/expr/optimizer"
 	"github.com/antonmedv/expr/parser"
+	"github.com/antonmedv/expr/vm"
 	"github.com/sanity-io/litter"
-	"io/ioutil"
-	"os"
 )
 
 var (
-	bytecode bool
-	debug    bool
-	run      bool
-	ast      bool
-	dot      bool
-	repl     bool
-	opt      bool
+	bytecode  bool
+	debug     bool
+	run       bool
+	past      bool
+	dot       bool
+	repl      bool
+	opt       bool
+	typeCheck bool
 )
 
 func init() {
 	flag.BoolVar(&bytecode, "bytecode", false, "disassemble bytecode")
 	flag.BoolVar(&debug, "debug", false, "debug program")
 	flag.BoolVar(&run, "run", false, "run program")
-	flag.BoolVar(&ast, "ast", false, "print ast")
+	flag.BoolVar(&past, "ast", false, "print ast")
 	flag.BoolVar(&dot, "dot", false, "dot format")
 	flag.BoolVar(&repl, "repl", false, "start repl")
 	flag.BoolVar(&opt, "opt", true, "do optimization")
+	flag.BoolVar(&typeCheck, "type", true, "do a type check")
 }
 
 func main() {
 	flag.Parse()
 
-	if ast {
+	if past {
 		printAst()
 		os.Exit(0)
 	}
@@ -81,15 +86,18 @@ func printAst() {
 	tree, err := parser.Parse(input())
 	check(err)
 
-	_, err = checker.Check(tree, nil)
-	check(err)
+	if typeCheck {
+		_, err = checker.Check(tree, nil)
+		check(err)
 
-	if opt {
-		optimizer.Optimize(&tree.Node)
+		if opt {
+			err = optimizer.Optimize(&tree.Node, nil)
+			check(err)
+		}
 	}
 
 	if !dot {
-		litter.Dump(tree.Node)
+		fmt.Println(ast.Dump(tree.Node))
 		return
 	}
 	dotAst(tree.Node)
@@ -99,11 +107,14 @@ func printDisassemble() {
 	tree, err := parser.Parse(input())
 	check(err)
 
-	_, err = checker.Check(tree, nil)
-	check(err)
+	if typeCheck {
+		_, err = checker.Check(tree, nil)
+		check(err)
 
-	if opt {
-		optimizer.Optimize(&tree.Node)
+		if opt {
+			err = optimizer.Optimize(&tree.Node, nil)
+			check(err)
+		}
 	}
 
 	program, err := compiler.Compile(tree, nil)
@@ -113,7 +124,23 @@ func printDisassemble() {
 }
 
 func runProgram() {
-	out, err := expr.Eval(input(), nil)
+	tree, err := parser.Parse(input())
+	check(err)
+
+	if typeCheck {
+		_, err = checker.Check(tree, nil)
+		check(err)
+
+		if opt {
+			err = optimizer.Optimize(&tree.Node, nil)
+			check(err)
+		}
+	}
+
+	program, err := compiler.Compile(tree, nil)
+	check(err)
+
+	out, err := vm.Run(program, nil)
 	check(err)
 
 	litter.Dump(out)

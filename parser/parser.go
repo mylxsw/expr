@@ -1,399 +1,579 @@
 package parser
 
-//go:generate antlr -Dlanguage=Go -listener -visitor -o gen -package gen Expr.g4
-
 import (
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/antlr/antlr4/runtime/Go/antlr"
-	"github.com/antonmedv/expr/ast"
-	"github.com/antonmedv/expr/internal/file"
-	"github.com/antonmedv/expr/parser/gen"
+	. "github.com/antonmedv/expr/ast"
+	"github.com/antonmedv/expr/file"
+	. "github.com/antonmedv/expr/parser/lexer"
 )
 
+type associativity int
+
+const (
+	left associativity = iota + 1
+	right
+)
+
+type operator struct {
+	precedence    int
+	associativity associativity
+}
+
+type builtin struct {
+	arity int
+}
+
+var unaryOperators = map[string]operator{
+	"not": {50, left},
+	"!":   {50, left},
+	"-":   {500, left},
+	"+":   {500, left},
+}
+
+var binaryOperators = map[string]operator{
+	"or":         {10, left},
+	"||":         {10, left},
+	"and":        {15, left},
+	"&&":         {15, left},
+	"==":         {20, left},
+	"!=":         {20, left},
+	"<":          {20, left},
+	">":          {20, left},
+	">=":         {20, left},
+	"<=":         {20, left},
+	"not in":     {20, left},
+	"in":         {20, left},
+	"matches":    {20, left},
+	"contains":   {20, left},
+	"startsWith": {20, left},
+	"endsWith":   {20, left},
+	"..":         {25, left},
+	"+":          {30, left},
+	"-":          {30, left},
+	"*":          {60, left},
+	"/":          {60, left},
+	"%":          {60, left},
+	"**":         {70, right},
+}
+
+var builtins = map[string]builtin{
+	"len":    {1},
+	"all":    {2},
+	"none":   {2},
+	"any":    {2},
+	"one":    {2},
+	"filter": {2},
+	"map":    {2},
+	"count":  {2},
+}
+
+type parser struct {
+	tokens  []Token
+	current Token
+	pos     int
+	err     *file.Error
+	closure bool
+}
+
 type Tree struct {
-	Node   ast.Node
+	Node   Node
 	Source *file.Source
 }
 
 func Parse(input string) (*Tree, error) {
 	source := file.NewSource(input)
-	is := antlr.NewInputStream(input)
 
-	lexer := gen.NewExprLexer(is)
-	stream := antlr.NewCommonTokenStream(lexer, antlr.TokenDefaultChannel)
-	expr := gen.NewExprParser(stream)
+	tokens, err := Lex(source)
+	if err != nil {
+		return nil, err
+	}
 
 	p := &parser{
-		errors: file.NewErrors(source),
+		tokens:  tokens,
+		current: tokens[0],
 	}
 
-	lexer.RemoveErrorListeners()
-	expr.RemoveErrorListeners()
-	lexer.AddErrorListener(p)
-	expr.AddErrorListener(p)
+	node := p.parseExpression(0)
 
-	antlr.ParseTreeWalkerDefault.Walk(p, expr.Start())
+	if !p.current.Is(EOF) {
+		p.error("unexpected token %v", p.current)
+	}
 
-	if p.errors.HasError() {
-		return nil, fmt.Errorf("%v", p.errors.First())
+	if p.err != nil {
+		return nil, p.err.Bind(source)
 	}
-	if len(p.stack) == 0 {
-		return nil, fmt.Errorf("empty stack")
-	}
-	if len(p.stack) > 1 {
-		return nil, fmt.Errorf("too long stack")
-	}
+
 	return &Tree{
-		Node:   p.stack[0],
+		Node:   node,
 		Source: source,
 	}, nil
 }
 
-type parser struct {
-	*gen.BaseExprListener
-	stack   []ast.Node
-	errors  *file.Errors
-	closure bool
+func (p *parser) error(format string, args ...interface{}) {
+	if p.err == nil { // show first error
+		p.err = &file.Error{
+			Location: p.current.Location,
+			Message:  fmt.Sprintf(format, args...),
+		}
+	}
 }
 
-func (p *parser) push(node ast.Node) ast.Node {
-	p.stack = append(p.stack, node)
-	return node
+func (p *parser) next() {
+	p.pos++
+	if p.pos >= len(p.tokens) {
+		p.error("unexpected end of expression")
+		return
+	}
+	p.current = p.tokens[p.pos]
 }
 
-func (p *parser) pop(ctx antlr.ParserRuleContext, it ...string) ast.Node {
-	if len(p.stack) == 0 {
-		if len(it) == 0 {
-			p.reportError(ctx, "parse error: the expression lacks something")
+func (p *parser) expect(kind Kind, values ...string) {
+	if p.current.Is(kind, values...) {
+		p.next()
+		return
+	}
+	p.error("unexpected token %v", p.current)
+}
+
+// parse functions
+
+func (p *parser) parseExpression(precedence int) Node {
+	nodeLeft := p.parsePrimary()
+
+	token := p.current
+	for token.Is(Operator) && p.err == nil {
+		if op, ok := binaryOperators[token.Value]; ok {
+			if op.precedence >= precedence {
+				p.next()
+
+				var nodeRight Node
+				if op.associativity == left {
+					nodeRight = p.parseExpression(op.precedence + 1)
+				} else {
+					nodeRight = p.parseExpression(op.precedence)
+				}
+
+				if token.Is(Operator, "matches") {
+					var r *regexp.Regexp
+					var err error
+
+					if s, ok := nodeRight.(*StringNode); ok {
+						r, err = regexp.Compile(s.Value)
+						if err != nil {
+							p.error("%v", err)
+						}
+					}
+					nodeLeft = &MatchesNode{
+						Regexp: r,
+						Left:   nodeLeft,
+						Right:  nodeRight,
+					}
+					nodeLeft.SetLocation(token.Location)
+				} else {
+					nodeLeft = &BinaryNode{
+						Operator: token.Value,
+						Left:     nodeLeft,
+						Right:    nodeRight,
+					}
+					nodeLeft.SetLocation(token.Location)
+				}
+				token = p.current
+				continue
+			}
+		}
+		break
+	}
+
+	if precedence == 0 {
+		nodeLeft = p.parseConditionalExpression(nodeLeft)
+	}
+
+	return nodeLeft
+}
+
+func (p *parser) parsePrimary() Node {
+	token := p.current
+
+	if token.Is(Operator) {
+		if op, ok := unaryOperators[token.Value]; ok {
+			p.next()
+			expr := p.parseExpression(op.precedence)
+			node := &UnaryNode{
+				Operator: token.Value,
+				Node:     expr,
+			}
+			node.SetLocation(token.Location)
+			return p.parsePostfixExpression(node)
+		}
+	}
+
+	if token.Is(Bracket, "(") {
+		p.next()
+		expr := p.parseExpression(0)
+		p.expect(Bracket, ")") // "an opened parenthesis is not properly closed"
+		return p.parsePostfixExpression(expr)
+	}
+
+	if p.closure {
+		if token.Is(Operator, "#") || token.Is(Operator, ".") {
+			if token.Is(Operator, "#") {
+				p.next()
+			}
+			node := &PointerNode{}
+			node.SetLocation(token.Location)
+			return p.parsePostfixExpression(node)
+		}
+	} else {
+		if token.Is(Operator, "#") || token.Is(Operator, ".") {
+			p.error("cannot use pointer accessor outside closure")
+		}
+	}
+
+	return p.parsePrimaryExpression()
+}
+
+func (p *parser) parseConditionalExpression(node Node) Node {
+	var expr1, expr2 Node
+	for p.current.Is(Operator, "?") && p.err == nil {
+		p.next()
+
+		if !p.current.Is(Operator, ":") {
+			expr1 = p.parseExpression(0)
+			p.expect(Operator, ":")
+			expr2 = p.parseExpression(0)
 		} else {
-			p.reportError(ctx, "parse error: the expression lacks "+strings.Join(it, ", "))
+			p.next()
+			expr1 = node
+			expr2 = p.parseExpression(0)
 		}
-		return &ast.NilNode{}
+
+		node = &ConditionalNode{
+			Cond: node,
+			Exp1: expr1,
+			Exp2: expr2,
+		}
 	}
-	node := p.stack[len(p.stack)-1]
-	p.stack = p.stack[:len(p.stack)-1]
 	return node
 }
 
-func (p *parser) reportError(ctx antlr.ParserRuleContext, format string, args ...interface{}) {
-	p.errors.ReportError(location(ctx), format, args...)
-}
+func (p *parser) parsePrimaryExpression() Node {
+	var node Node
+	token := p.current
 
-func (p *parser) EnterIdentifier(ctx *gen.IdentifierContext) {
-	p.push(&ast.IdentifierNode{Value: ctx.GetText()}).SetLocation(location(ctx))
-}
+	switch token.Kind {
 
-func (p *parser) EnterPointer(ctx *gen.PointerContext) {
-	p.push(&ast.PointerNode{}).SetLocation(location(ctx))
-}
-
-func (p *parser) EnterString(ctx *gen.StringContext) {
-	var value string
-	if s, err := unescape(ctx.GetText()); err == nil {
-		value = s
-	} else {
-		p.reportError(ctx, "parse error: %v", err)
-		return
-	}
-	node := &ast.StringNode{
-		Value: value,
-	}
-	p.push(node).SetLocation(location(ctx))
-}
-
-func (p *parser) EnterInteger(ctx *gen.IntegerContext) {
-	if node := ctx.IntegerLiteral(); node != nil {
-		text := node.GetText()
-		text = strings.Replace(text, "_", "", -1)
-		i, err := strconv.ParseInt(text, 10, 64)
-		if err != nil {
-			p.reportError(ctx, "parse error: invalid int literal")
-			return
+	case Identifier:
+		p.next()
+		switch token.Value {
+		case "true":
+			node := &BoolNode{Value: true}
+			node.SetLocation(token.Location)
+			return node
+		case "false":
+			node := &BoolNode{Value: false}
+			node.SetLocation(token.Location)
+			return node
+		case "nil":
+			node := &NilNode{}
+			node.SetLocation(token.Location)
+			return node
+		default:
+			node = p.parseIdentifierExpression(token)
 		}
-		p.push(&ast.IntegerNode{Value: int(i)}).SetLocation(location(ctx))
-	} else if node := ctx.HexIntegerLiteral(); node != nil {
-		text := node.GetText()
-		i, err := strconv.ParseInt(text, 0, 64)
-		if err != nil {
-			p.reportError(ctx, "parse error: invalid hex literal")
-			return
+
+	case Number:
+		p.next()
+		value := strings.Replace(token.Value, "_", "", -1)
+		if strings.ContainsAny(value, ".eE") {
+			number, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				p.error("invalid float literal: %v", err)
+			}
+			node := &FloatNode{Value: number}
+			node.SetLocation(token.Location)
+			return node
+		} else if strings.Contains(value, "x") {
+			number, err := strconv.ParseInt(value, 0, 64)
+			if err != nil {
+				p.error("invalid hex literal: %v", err)
+			}
+			node := &IntegerNode{Value: int(number)}
+			node.SetLocation(token.Location)
+			return node
+		} else {
+			number, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				p.error("invalid integer literal: %v", err)
+			}
+			node := &IntegerNode{Value: int(number)}
+			node.SetLocation(token.Location)
+			return node
 		}
-		p.push(&ast.IntegerNode{Value: int(i)}).SetLocation(location(ctx))
-	} else {
-		p.reportError(ctx, "parse error: invalid octal literal")
-	}
-}
 
-func (p *parser) EnterFloat(ctx *gen.FloatContext) {
-	f, err := strconv.ParseFloat(ctx.GetText(), 64)
-	if err != nil {
-		p.reportError(ctx, "parse error: invalid float literal")
-		return
-	}
-	p.push(&ast.FloatNode{Value: f}).SetLocation(location(ctx))
-}
+	case String:
+		p.next()
+		node := &StringNode{Value: token.Value}
+		node.SetLocation(token.Location)
+		return node
 
-func (p *parser) EnterBoolean(ctx *gen.BooleanContext) {
-	b, err := strconv.ParseBool(ctx.GetText())
-	if err != nil {
-		p.reportError(ctx, "parse error: invalid boolean literal")
-		return
-	}
-	p.push(&ast.BoolNode{Value: b}).SetLocation(location(ctx))
-}
-
-func (p *parser) EnterNil(ctx *gen.NilContext) {
-	p.push(&ast.NilNode{}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitUnary(ctx *gen.UnaryContext) {
-	p.push(&ast.UnaryNode{
-		Operator: ctx.GetOp().GetText(),
-		Node:     p.pop(ctx),
-	}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitBinary(ctx *gen.BinaryContext) {
-	p.push(&ast.BinaryNode{
-		Operator: ctx.GetOp().GetText(),
-		Right:    p.pop(ctx),
-		Left:     p.pop(ctx),
-	}).SetLocation(locationToken(ctx.GetOp()))
-}
-
-func (p *parser) ExitMatches(ctx *gen.MatchesContext) {
-	right := p.pop(ctx)
-	left := p.pop(ctx)
-	node := &ast.MatchesNode{
-		Right: right,
-		Left:  left,
-	}
-
-	var err error
-	var r *regexp.Regexp
-	if s, ok := right.(*ast.StringNode); ok {
-		r, err = regexp.Compile(s.Value)
-		if err != nil {
-			p.reportError(ctx.GetPattern(), "%v", err)
-			return
-		}
-		node.Regexp = r
-	}
-	p.push(node).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitCall(ctx *gen.CallContext) {
-	expr := ctx.GetChild(0)
-	args := ctx.GetArgs()
-
-	var list []gen.IExprContext
-	if args != nil {
-		list = args.GetList()
-	}
-	arguments := p.arguments(ctx, list)
-
-	switch c := expr.(type) {
-	case *gen.IdentifierContext:
-		p.push(&ast.FunctionNode{
-			Arguments: arguments,
-			Name:      p.pop(ctx).(*ast.IdentifierNode).Value,
-		}).SetLocation(location(ctx))
-	case *gen.MemberDotContext:
-		p.push(&ast.MethodNode{
-			Arguments: arguments,
-			Method:    c.GetName().GetText(),
-			Node:      p.pop(ctx).(*ast.PropertyNode).Node,
-		}).SetLocation(location(ctx))
 	default:
-		p.reportError(ctx, "parse error: undefined call expression")
-	}
-}
-
-func (p *parser) arguments(ctx antlr.ParserRuleContext, list []gen.IExprContext) []ast.Node {
-	args := make([]ast.Node, 0)
-	for range list {
-		args = append([]ast.Node{p.pop(ctx)}, args...)
-	}
-	return args
-}
-
-func (p *parser) ExitMemberIndex(ctx *gen.MemberIndexContext) {
-	p.push(&ast.IndexNode{
-		Index: p.pop(ctx),
-		Node:  p.pop(ctx),
-	}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitSlice(ctx *gen.SliceContext) {
-	var a, b ast.Node
-	if ctx.GetB() != nil {
-		b = p.pop(ctx)
-	}
-	if ctx.GetA() != nil {
-		a = p.pop(ctx)
-	}
-	node := p.pop(ctx)
-	p.push(&ast.SliceNode{
-		Node: node,
-		From: a,
-		To:   b,
-	}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitMemberDot(ctx *gen.MemberDotContext) {
-	var property string
-	name := ctx.GetName()
-	if name != nil {
-		property = name.GetText()
-	}
-	p.push(&ast.PropertyNode{
-		Node:     p.pop(ctx),
-		Property: property,
-	}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitTernary(ctx *gen.TernaryContext) {
-	expr2 := p.pop(ctx)
-	expr1 := p.pop(ctx)
-	cond := p.pop(ctx)
-	p.push(&ast.ConditionalNode{
-		Exp2: expr2,
-		Exp1: expr1,
-		Cond: cond,
-	}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitArrayLiteral(ctx *gen.ArrayLiteralContext) {
-	list := ctx.GetList()
-	nodes := make([]ast.Node, 0)
-	for range list {
-		nodes = append([]ast.Node{p.pop(ctx)}, nodes...)
-	}
-	p.push(&ast.ArrayNode{Nodes: nodes}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitMapLiteral(ctx *gen.MapLiteralContext) {
-	e := ctx.GetE()
-	if e == nil {
-		p.push(&ast.MapNode{}).SetLocation(location(ctx))
-		return
-	}
-
-	nodes := make([]ast.Node, 0)
-	for range e.GetList() {
-		nodes = append([]ast.Node{p.pop(ctx).(*ast.PairNode)}, nodes...)
-	}
-	p.push(&ast.MapNode{Pairs: nodes}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitPropertyAssignment(ctx *gen.PropertyAssignmentContext) {
-	value := p.pop(ctx)
-	name := ctx.GetName().(*gen.PropertyNameContext)
-
-	var s string
-	if id := name.Identifier(); id != nil {
-		s = id.GetText()
-	} else if str := name.StringLiteral(); str != nil {
-		s2, err := unescape(str.GetText())
-		if err != nil {
-			p.reportError(ctx, "parse error: %v", err)
-			return
+		if token.Is(Bracket, "[") {
+			node = p.parseArrayExpression(token)
+		} else if token.Is(Bracket, "{") {
+			node = p.parseMapExpression(token)
+		} else {
+			p.error("unexpected token %v", token)
 		}
-		s = s2
+	}
+
+	return p.parsePostfixExpression(node)
+}
+
+func (p *parser) parseIdentifierExpression(token Token) Node {
+	var node Node
+	if p.current.Is(Bracket, "(") {
+		var arguments []Node
+
+		if b, ok := builtins[token.Value]; ok {
+			p.expect(Bracket, "(")
+			// TODO: Add builtins signatures.
+			if b.arity == 1 {
+				arguments = make([]Node, 1)
+				arguments[0] = p.parseExpression(0)
+			} else if b.arity == 2 {
+				arguments = make([]Node, 2)
+				arguments[0] = p.parseExpression(0)
+				p.expect(Operator, ",")
+				arguments[1] = p.parseClosure()
+			}
+			p.expect(Bracket, ")")
+
+			node = &BuiltinNode{
+				Name:      token.Value,
+				Arguments: arguments,
+			}
+			node.SetLocation(token.Location)
+		} else {
+			arguments = p.parseArguments()
+			node = &FunctionNode{
+				Name:      token.Value,
+				Arguments: arguments,
+			}
+			node.SetLocation(token.Location)
+		}
 	} else {
-		p.reportError(ctx, "parse error: invalid key type")
-		return
+		node = &IdentifierNode{Value: token.Value}
+		node.SetLocation(token.Location)
 	}
-
-	key := &ast.StringNode{Value: s}
-	key.SetLocation(location(ctx))
-
-	p.push(&ast.PairNode{
-		Key:   key,
-		Value: value,
-	}).SetLocation(location(ctx))
+	return node
 }
 
-func (p *parser) ExitBuiltinLen(ctx *gen.BuiltinLenContext) {
-	name := ctx.GetName().GetText()
-	node := p.pop(ctx.GetE())
+func (p *parser) parseClosure() Node {
+	token := p.current
+	p.expect(Bracket, "{")
 
-	p.push(&ast.BuiltinNode{
-		Name:      name,
-		Arguments: []ast.Node{node},
-	}).SetLocation(location(ctx))
-}
-
-func (p *parser) ExitBuiltin(ctx *gen.BuiltinContext) {
-	name := ctx.GetName().GetText()
-	closure := p.pop(ctx.GetC())
-	node := p.pop(ctx.GetE())
-
-	p.push(&ast.BuiltinNode{
-		Name:      name,
-		Arguments: []ast.Node{node, closure},
-	}).SetLocation(location(ctx))
-}
-
-func (p *parser) EnterClosure(ctx *gen.ClosureContext) {
 	p.closure = true
-}
-
-func (p *parser) ExitClosure(ctx *gen.ClosureContext) {
+	node := p.parseExpression(0)
 	p.closure = false
-	p.push(&ast.ClosureNode{
-		Node: p.pop(ctx),
-	}).SetLocation(location(ctx))
-}
 
-func (p *parser) ExitClosureMemberDot(ctx *gen.ClosureMemberDotContext) {
-	if !p.closure {
-		p.reportError(ctx, "parse error: dot property accessor can be only inside closure")
-		return
+	p.expect(Bracket, "}")
+	closure := &ClosureNode{
+		Node: node,
 	}
-	var property string
-	name := ctx.GetName()
-	if name != nil {
-		property = name.GetText()
+	closure.SetLocation(token.Location)
+	return closure
+}
+
+func (p *parser) parseArrayExpression(token Token) Node {
+	nodes := make([]Node, 0)
+
+	p.expect(Bracket, "[")
+	for !p.current.Is(Bracket, "]") && p.err == nil {
+		if len(nodes) > 0 {
+			p.expect(Operator, ",")
+			if p.current.Is(Bracket, "]") {
+				goto end
+			}
+		}
+		node := p.parseExpression(0)
+		nodes = append(nodes, node)
 	}
-	pointer := &ast.PointerNode{}
-	pointer.SetLocation(location(ctx))
-	p.push(&ast.PropertyNode{
-		Node:     pointer,
-		Property: property,
-	}).SetLocation(location(ctx))
+end:
+	p.expect(Bracket, "]")
+
+	node := &ArrayNode{Nodes: nodes}
+	node.SetLocation(token.Location)
+	return node
 }
 
-func (p *parser) SyntaxError(recognizer antlr.Recognizer, offendingSymbol interface{}, line, column int, msg string, e antlr.RecognitionException) {
-	p.errors.ReportError(file.Location{Line: line, Column: column}, fmt.Sprintf("syntax error: %s", msg))
-}
+func (p *parser) parseMapExpression(token Token) Node {
+	p.expect(Bracket, "{")
 
-func (p *parser) ReportAmbiguity(_ antlr.Parser, _ *antlr.DFA, _, _ int, _ bool, _ *antlr.BitSet, _ antlr.ATNConfigSet) {
-}
+	nodes := make([]Node, 0)
+	for !p.current.Is(Bracket, "}") && p.err == nil {
+		if len(nodes) > 0 {
+			p.expect(Operator, ",")
+			if p.current.Is(Bracket, "}") {
+				goto end
+			}
+			if p.current.Is(Operator, ",") {
+				p.error("unexpected token %v", p.current)
+			}
+		}
 
-func (p *parser) ReportAttemptingFullContext(_ antlr.Parser, _ *antlr.DFA, _, _ int, _ *antlr.BitSet, _ antlr.ATNConfigSet) {
-}
+		var key Node
+		// a map key can be:
+		//  * a number
+		//  * a string
+		//  * a identifier, which is equivalent to a string
+		//  * an expression, which must be enclosed in parentheses -- (1 + 2)
+		if p.current.Is(Number) || p.current.Is(String) || p.current.Is(Identifier) {
+			key = &StringNode{Value: p.current.Value}
+			key.SetLocation(token.Location)
+			p.next()
+		} else if p.current.Is(Bracket, "(") {
+			key = p.parseExpression(0)
+		} else {
+			p.error("a map key must be a quoted string, a number, a identifier, or an expression enclosed in parentheses (unexpected token %v)", p.current)
+		}
 
-func (p *parser) ReportContextSensitivity(_ antlr.Parser, _ *antlr.DFA, _, _, _ int, _ antlr.ATNConfigSet) {
-}
+		p.expect(Operator, ":")
 
-func location(ctx antlr.ParserRuleContext) file.Location {
-	if ctx == nil {
-		return file.Location{Line: 0, Column: 0}
+		node := p.parseExpression(0)
+		pair := &PairNode{Key: key, Value: node}
+		pair.SetLocation(token.Location)
+		nodes = append(nodes, pair)
 	}
 
-	token := ctx.GetStart()
-	if token == nil {
-		return file.Location{Line: 0, Column: 0}
-	}
+end:
+	p.expect(Bracket, "}")
 
-	return file.Location{Line: token.GetLine(), Column: token.GetColumn()}
+	node := &MapNode{Pairs: nodes}
+	node.SetLocation(token.Location)
+	return node
 }
 
-func locationToken(token antlr.Token) file.Location {
-	return file.Location{Line: token.GetLine(), Column: token.GetColumn()}
+func (p *parser) parsePostfixExpression(node Node) Node {
+	token := p.current
+	for (token.Is(Operator) || token.Is(Bracket)) && p.err == nil {
+		if token.Value == "." {
+			p.next()
+
+			token = p.current
+			p.next()
+
+			if token.Kind != Identifier &&
+				// Operators like "not" and "matches" are valid methods or property names.
+				(token.Kind != Operator || !isValidIdentifier(token.Value)) {
+				p.error("expected name")
+			}
+
+			if p.current.Is(Bracket, "(") {
+				arguments := p.parseArguments()
+				node = &MethodNode{
+					Node:      node,
+					Method:    token.Value,
+					Arguments: arguments,
+				}
+				node.SetLocation(token.Location)
+			} else {
+				node = &PropertyNode{
+					Node:     node,
+					Property: token.Value,
+				}
+				node.SetLocation(token.Location)
+			}
+
+		} else if token.Value == "[" {
+			p.next()
+			var from, to Node
+
+			if p.current.Is(Operator, ":") { // slice without from [:1]
+				p.next()
+
+				if !p.current.Is(Bracket, "]") { // slice without from and to [:]
+					to = p.parseExpression(0)
+				}
+
+				node = &SliceNode{
+					Node: node,
+					To:   to,
+				}
+				node.SetLocation(token.Location)
+				p.expect(Bracket, "]")
+
+			} else {
+
+				from = p.parseExpression(0)
+
+				if p.current.Is(Operator, ":") {
+					p.next()
+
+					if !p.current.Is(Bracket, "]") { // slice without to [1:]
+						to = p.parseExpression(0)
+					}
+
+					node = &SliceNode{
+						Node: node,
+						From: from,
+						To:   to,
+					}
+					node.SetLocation(token.Location)
+					p.expect(Bracket, "]")
+
+				} else {
+					// Slice operator [:] was not found, it should by just index node.
+
+					node = &IndexNode{
+						Node:  node,
+						Index: from,
+					}
+					node.SetLocation(token.Location)
+					p.expect(Bracket, "]")
+				}
+			}
+
+		} else {
+			break
+		}
+
+		token = p.current
+	}
+	return node
+}
+
+func isValidIdentifier(str string) bool {
+	if len(str) == 0 {
+		return false
+	}
+	h, w := utf8.DecodeRuneInString(str)
+	if !IsAlphabetic(h) {
+		return false
+	}
+	for _, r := range str[w:] {
+		if !IsAlphaNumeric(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *parser) parseArguments() []Node {
+	p.expect(Bracket, "(")
+	nodes := make([]Node, 0)
+	for !p.current.Is(Bracket, ")") && p.err == nil {
+		if len(nodes) > 0 {
+			p.expect(Operator, ",")
+		}
+		node := p.parseExpression(0)
+		nodes = append(nodes, node)
+	}
+	p.expect(Bracket, ")")
+
+	return nodes
 }

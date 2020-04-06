@@ -1,9 +1,26 @@
-package parser
+package lexer
 
 import (
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
+)
+
+func IsSpace(r rune) bool {
+	return unicode.IsSpace(r)
+}
+
+func IsAlphaNumeric(r rune) bool {
+	return IsAlphabetic(r) || unicode.IsDigit(r)
+}
+
+func IsAlphabetic(r rune) bool {
+	return r == '_' || r == '$' || unicode.IsLetter(r)
+}
+
+var (
+	newlineNormalizer = strings.NewReplacer("\r\n", "\n", "\r", "\n")
 )
 
 // Unescape takes a quoted string, unquotes, and unescapes it.
@@ -175,7 +192,3 @@ func unhex(b byte) (rune, bool) {
 	}
 	return 0, false
 }
-
-var (
-	newlineNormalizer = strings.NewReplacer("\r\n", "\n", "\r", "\n")
-)

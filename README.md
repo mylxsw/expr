@@ -1,7 +1,6 @@
 # Expr 
 [![Build Status](https://travis-ci.org/antonmedv/expr.svg?branch=master)](https://travis-ci.org/antonmedv/expr) 
 [![Go Report Card](https://goreportcard.com/badge/github.com/antonmedv/expr)](https://goreportcard.com/report/github.com/antonmedv/expr) 
-[![Code Coverage](https://scrutinizer-ci.com/g/antonmedv/expr/badges/coverage.png?b=master)](https://scrutinizer-ci.com/g/antonmedv/expr/?branch=master) 
 [![GoDoc](https://godoc.org/github.com/antonmedv/expr?status.svg)](https://godoc.org/github.com/antonmedv/expr)
 
 <img src="docs/images/logo-small.png" width="150" alt="expr logo" align="right">
@@ -39,7 +38,7 @@ product.Stock < 15
 * Reasonable set of basic operators.
 * Builtins `all`, `none`, `any`, `one`, `filter`, `map`.
   ```coffeescript
-  all(Tweets, {.Size < 140})
+  all(Tweets, {.Size <= 280})
   ```
 * Fast ([benchmarks](https://github.com/antonmedv/golang-expression-evaluation-comparison#readme)): uses bytecode virtual machine and optimizing compiler.
 
@@ -49,67 +48,92 @@ product.Stock < 15
 go get github.com/antonmedv/expr
 ```
 
-<a href="https://www.patreon.com/antonmedv">
-	<img src="https://c5.patreon.com/external/logo/become_a_patron_button@2x.png" width="160">
-</a>
-
 ## Documentation
 
 * See [Getting Started](docs/Getting-Started.md) page for developer documentation.
 * See [Language Definition](docs/Language-Definition.md) page to learn the syntax.
 
-## Input widget
+## Expr Code Editor
 
-<img src="https://user-images.githubusercontent.com/141232/61127899-3e249280-a4b9-11e9-8e88-385e2d769cce.png" align="right" alt="input widget screenshot" width="297">
+<a href="http://bit.ly/expr-code-editor">
+	<img src="https://antonmedv.github.io/expr/ogimage.png" align="center" alt="Expr Code Editor" width="1200">
+</a>
 
-Also, I have an input widget for react, vue and angular which allows editing expressions with syntax highlighting and autocomplete based on your types declaration of environment. 
+Also, I have an embeddable code editor written in JavaScript which allows editing expressions with syntax highlighting and autocomplete based on your types declaration.
 
-[Contact me to buy ($499)](mailto:anton@medv.io)
+[Learn more →](https://antonmedv.github.io/expr/)
 
 ## Examples
 
-Executing arbitrary expressions.
+[Play Online](https://play.golang.org/p/z7T8ytJ1T1d)
 
 ```go
-env := map[string]interface{}{
-    "foo": 1,
-    "bar": struct{Value int}{1},
-}
+package main
 
-out, err := expr.Eval("foo + bar.Value", env)
+import (
+	"fmt"
+	"github.com/antonmedv/expr"
+)
+
+func main() {
+	env := map[string]interface{}{
+		"greet":   "Hello, %v!",
+		"names":   []string{"world", "you"},
+		"sprintf": fmt.Sprintf,
+	}
+
+	code := `sprintf(greet, names[0])`
+
+	program, err := expr.Compile(code, expr.Env(env))
+	if err != nil {
+		panic(err)
+	}
+
+	output, err := expr.Run(program, env)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(output)
+}
 ```
 
-Static type checker with struct as environment.
+[Play Online](https://play.golang.org/p/4S4brsIvU4i)
 
 ```go
+package main
+
+import (
+	"fmt"
+	"github.com/antonmedv/expr"
+)
+
+type Tweet struct {
+	Len int
+}
+
 type Env struct {
-	Foo int
-	Bar *Bar
+	Tweets []Tweet
 }
 
-type Bar struct {
-	Value int
+func main() {
+	code := `all(Tweets, {.Len <= 240})`
+
+	program, err := expr.Compile(code, expr.Env(Env{}))
+	if err != nil {
+		panic(err)
+	}
+
+	env := Env{
+		Tweets: []Tweet{{42}, {98}, {69}},
+	}
+	output, err := expr.Run(program, env)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(output)
 }
-
-program, err := expr.Compile("Foo + Bar.Value", expr.Env(&Env{}))
-
-out, err := expr.Run(program, &Env{1, &Bar{2}})
-```
-
-Using env's methods as functions inside expressions.
-
-```go
-type Env struct {
-	Name string
-}
-
-func (e *Env) Title() string {
-	return strings.Title(e.Name)
-}
-
-program, err := expr.Compile(`"Hello " + Title()`, expr.Env(&Env{}))
-
-out, err := expr.Run(program, &Env{"world"})
 ```
 
 ## Contributing
@@ -125,8 +149,20 @@ Also expr provides powerful tool [exe](cmd/exe) for debugging. It has interactiv
 
 ## Who is using Expr?
 
-* [Aviasales](https://aviasales.ru) are actively using Expr for different parts of the search engine.
-* [Mystery Minds](https://www.mysteryminds.com/en/) uses Expr to allow easy yet powerful customization of its matching algorithm.
+<table>
+	<tr>
+		<td>
+			<p align="center"><a href="https://aviasales.ru"><img alt="Aviasales Logo" height="100" src="https://cdn.worldvectorlogo.com/logos/aviasales-4.svg"></a></p>
+			<p><a href="https://aviasales.ru">Aviasales</a> are actively using Expr for different parts of the search engine.</p>
+		</td>
+		<td>
+			<p align="center"><a href="https://www.mysteryminds.com/en/"><img alt="Mystery Minds Logo" height="100" src="https://www.mysteryminds.com/wp-content/uploads/2018/07/MM_logo_colours.png"></a></p>
+			<p><a href="https://www.mysteryminds.com/en/">Mystery Minds</a> uses Expr to allow easy yet powerful customization of its matching algorithm.</p>
+		</td>
+	</tr>
+</table>
+
+[Add you company too](https://github.com/antonmedv/expr/edit/master/README.md)
 
 ## License
 

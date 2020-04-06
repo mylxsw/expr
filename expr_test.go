@@ -3,18 +3,23 @@ package expr_test
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/antonmedv/expr/ast"
+	"github.com/antonmedv/expr/file"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/antonmedv/expr"
-	"github.com/antonmedv/expr/vm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func ExampleEval() {
-	output, err := expr.Eval("'hello world'", nil)
+	output, err := expr.Eval("greet + name", map[string]interface{}{
+		"greet": "Hello, ",
+		"name":  "world!",
+	})
 	if err != nil {
 		fmt.Printf("err: %v", err)
 		return
@@ -22,103 +27,16 @@ func ExampleEval() {
 
 	fmt.Printf("%v", output)
 
-	// Output: hello world
+	// Output: Hello, world!
 }
 
-func ExampleEval_map() {
-	env := map[string]interface{}{
-		"foo": 1,
-		"bar": []string{"zero", "hello world"},
-		"swipe": func(in string) string {
-			return strings.Replace(in, "world", "user", 1)
-		},
-	}
+func ExampleEval_runtime_error() {
+	_, err := expr.Eval(`map(1..3, {1 / (# - 3)})`, nil)
+	fmt.Print(err)
 
-	output, err := expr.Eval("swipe(bar[foo])", env)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	fmt.Printf("%v", output)
-
-	// Output: hello user
-}
-
-type mockMapEnv map[string]interface{}
-
-func (mockMapEnv) Swipe(in string) string {
-	return strings.Replace(in, "world", "user", 1)
-}
-
-func ExampleEval_map_method() {
-	env := mockMapEnv{
-		"foo": 1,
-		"bar": []string{"zero", "hello world"},
-	}
-
-	program, err := expr.Compile("Swipe(bar[foo])", expr.Env(env))
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	output, err := expr.Run(program, env)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	fmt.Printf("%v", output)
-
-	// Output: hello user
-}
-
-func ExampleEval_struct() {
-	type C struct{ C int }
-	type B struct{ B *C }
-	type A struct{ A B }
-
-	env := A{B{&C{42}}}
-
-	output, err := expr.Eval("A.B.C", env)
-
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	fmt.Printf("%v", output)
-
-	// Output: 42
-}
-
-func ExampleEval_error() {
-	output, err := expr.Eval("(boo + bar]", nil)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	fmt.Printf("%v", output)
-
-	// Output: syntax error: mismatched input ']' expecting ')' (1:11)
-	//  | (boo + bar]
-	//  | ..........^
-}
-
-func ExampleEval_matches() {
-	output, err := expr.Eval(`"a" matches "a("`, nil)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	fmt.Printf("%v", output)
-
-	// Output: error parsing regexp: missing closing ): `a(` (1:13)
-	//  | "a" matches "a("
-	//  | ............^
+	// Output: runtime error: integer divide by zero (1:14)
+	//  | map(1..3, {1 / (# - 3)})
+	//  | .............^
 }
 
 func ExampleCompile() {
@@ -151,22 +69,30 @@ func ExampleEnv() {
 	type Passengers struct {
 		Adults int
 	}
-	type Request struct {
+	type Meta struct {
+		Tags map[string]string
+	}
+	type Env struct {
+		Meta
 		Segments   []*Segment
 		Passengers *Passengers
 		Marker     string
-		Meta       map[string]interface{}
 	}
 
-	code := `Segments[0].Origin == "MOW" && Passengers.Adults == 2 && Marker == "test" && Meta["accept"]`
+	code := `all(Segments, {.Origin == "MOW"}) && Passengers.Adults > 0 && Tags["foo"] startsWith "bar"`
 
-	program, err := expr.Compile(code, expr.Env(&Request{}))
+	program, err := expr.Compile(code, expr.Env(Env{}))
 	if err != nil {
 		fmt.Printf("%v", err)
 		return
 	}
 
-	request := &Request{
+	env := Env{
+		Meta: Meta{
+			Tags: map[string]string{
+				"foo": "bar",
+			},
+		},
 		Segments: []*Segment{
 			{Origin: "MOW"},
 		},
@@ -174,10 +100,9 @@ func ExampleEnv() {
 			Adults: 2,
 		},
 		Marker: "test",
-		Meta:   map[string]interface{}{"accept": true},
 	}
 
-	output, err := expr.Run(program, request)
+	output, err := expr.Run(program, env)
 	if err != nil {
 		fmt.Printf("%v", err)
 		return
@@ -186,33 +111,6 @@ func ExampleEnv() {
 	fmt.Printf("%v", output)
 
 	// Output: true
-}
-
-func ExampleEnv_with_undefined_variables() {
-	env := map[string]interface{}{
-		"foo": 0,
-		"bar": 0,
-	}
-
-	program, err := expr.Compile(`foo + (bar != nil ? bar : 2)`, expr.Env(env))
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	request := map[string]interface{}{
-		"foo": 3,
-	}
-
-	output, err := expr.Run(program, request)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
-
-	fmt.Printf("%v", output)
-
-	// Output: 5
 }
 
 func ExampleAsBool() {
@@ -237,6 +135,18 @@ func ExampleAsBool() {
 	// Output: true
 }
 
+func ExampleAsBool_error() {
+	env := map[string]interface{}{
+		"foo": 0,
+	}
+
+	_, err := expr.Compile("foo + 42", expr.Env(env), expr.AsBool())
+
+	fmt.Printf("%v", err)
+
+	// Output: expected bool, but got int
+}
+
 func ExampleAsFloat64() {
 	program, err := expr.Compile("42", expr.AsFloat64())
 	if err != nil {
@@ -255,12 +165,20 @@ func ExampleAsFloat64() {
 	// Output: 42
 }
 
+func ExampleAsFloat64_error() {
+	_, err := expr.Compile(`!!true`, expr.AsFloat64())
+
+	fmt.Printf("%v", err)
+
+	// Output: expected float64, but got bool
+}
+
 func ExampleAsInt64() {
-	env := map[string]float64{
-		"foo": 3,
+	env := map[string]interface{}{
+		"rating": 5.5,
 	}
 
-	program, err := expr.Compile("foo + 2", expr.Env(env), expr.AsInt64())
+	program, err := expr.Compile("rating", expr.Env(env), expr.AsInt64())
 	if err != nil {
 		fmt.Printf("%v", err)
 		return
@@ -278,38 +196,38 @@ func ExampleAsInt64() {
 }
 
 func ExampleOperator() {
-	type Place struct {
-		Code string
-	}
-	type Segment struct {
-		Origin Place
-	}
-	type Helpers struct {
-		PlaceEq func(p Place, s string) bool
-	}
-	type Request struct {
-		Segments []*Segment
-		Helpers
+	code := `
+		Now() > CreatedAt &&
+		(Now() - CreatedAt).Hours() > 24
+	`
+
+	type Env struct {
+		CreatedAt time.Time
+		Now       func() time.Time
+		Sub       func(a, b time.Time) time.Duration
+		After     func(a, b time.Time) bool
 	}
 
-	code := `Segments[0].Origin == "MOW" && PlaceEq(Segments[0].Origin, "MOW")`
+	options := []expr.Option{
+		expr.Env(Env{}),
+		expr.Operator(">", "After"),
+		expr.Operator("-", "Sub"),
+	}
 
-	program, err := expr.Compile(code, expr.Env(&Request{}), expr.Operator("==", "PlaceEq"))
+	program, err := expr.Compile(code, options...)
 	if err != nil {
 		fmt.Printf("%v", err)
 		return
 	}
 
-	request := &Request{
-		Segments: []*Segment{
-			{Origin: Place{Code: "MOW"}},
-		},
-		Helpers: Helpers{PlaceEq: func(p Place, s string) bool {
-			return p.Code == s
-		}},
+	env := Env{
+		CreatedAt: time.Date(2018, 7, 14, 0, 0, 0, 0, time.UTC),
+		Now:       func() time.Time { return time.Now() },
+		Sub:       func(a, b time.Time) time.Duration { return a.Sub(b) },
+		After:     func(a, b time.Time) bool { return a.After(b) },
 	}
 
-	output, err := expr.Run(program, request)
+	output, err := expr.Run(program, env)
 	if err != nil {
 		fmt.Printf("%v", err)
 		return
@@ -320,88 +238,241 @@ func ExampleOperator() {
 	// Output: true
 }
 
-func ExampleOperator_time() {
-	type Segment struct {
-		Date time.Time
+func fib(n int) int {
+	if n <= 1 {
+		return n
 	}
-	type Request struct {
-		Segments []Segment
-		Before   func(a, b time.Time) bool
-		Date     func(s string) time.Time
+	return fib(n-1) + fib(n-2)
+}
+
+func ExampleConstExpr() {
+	code := `[fib(5), fib(3+3), fib(dyn)]`
+
+	env := map[string]interface{}{
+		"fib": fib,
+		"dyn": 0,
 	}
 
-	code := `Date("2001-01-01") < Segments[0].Date`
+	options := []expr.Option{
+		expr.Env(env),
+		expr.ConstExpr("fib"), // Mark fib func as constant expression.
+	}
 
-	program, err := expr.Compile(code, expr.Env(&Request{}), expr.Operator("<", "Before"))
+	program, err := expr.Compile(code, options...)
 	if err != nil {
 		fmt.Printf("%v", err)
 		return
 	}
 
-	request := &Request{
-		Segments: []Segment{
-			{Date: time.Date(2019, 7, 1, 0, 0, 0, 0, time.UTC)},
-		},
-		Before: func(a, b time.Time) bool {
-			return a.Before(b)
-		},
-		Date: func(s string) time.Time {
-			date, err := time.Parse("2006-01-02", s)
-			if err != nil {
-				panic(err)
+	// Only fib(5) and fib(6) calculated on Compile, fib(dyn) can be called at runtime.
+	env["dyn"] = 7
+
+	output, err := expr.Run(program, env)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+
+	fmt.Printf("%v\n", output)
+
+	// Output: [5 8 13]
+}
+
+func ExampleAllowUndefinedVariables() {
+	code := `name == nil ? "Hello, world!" : sprintf("Hello, %v!", name)`
+
+	env := map[string]interface{}{
+		"sprintf": fmt.Sprintf,
+	}
+
+	options := []expr.Option{
+		expr.Env(env),
+		expr.AllowUndefinedVariables(), // Allow to use undefined variables.
+	}
+
+	program, err := expr.Compile(code, options...)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+
+	output, err := expr.Run(program, env)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+	fmt.Printf("%v\n", output)
+
+	env["name"] = "you" // Define variables later on.
+
+	output, err = expr.Run(program, env)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+	fmt.Printf("%v\n", output)
+
+	// Output: Hello, world!
+	// Hello, you!
+}
+
+func ExampleAllowUndefinedVariables_zero_value() {
+	code := `name == "" ? foo + bar : foo + name`
+
+	// If environment has different zero values, then undefined variables
+	// will have it as default value.
+	env := map[string]string{}
+
+	options := []expr.Option{
+		expr.Env(env),
+		expr.AllowUndefinedVariables(), // Allow to use undefined variables.
+	}
+
+	program, err := expr.Compile(code, options...)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+
+	env = map[string]string{
+		"foo": "Hello, ",
+		"bar": "world!",
+	}
+
+	output, err := expr.Run(program, env)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+	fmt.Printf("%v", output)
+
+	// Output: Hello, world!
+}
+
+func ExampleAllowUndefinedVariables_zero_value_functions() {
+	code := `words == "" ? Split("foo,bar", ",") : Split(words, ",")`
+
+	// Env is map[string]string type on which methods are defined.
+	env := mockMapStringStringEnv{}
+
+	options := []expr.Option{
+		expr.Env(env),
+		expr.AllowUndefinedVariables(), // Allow to use undefined variables.
+	}
+
+	program, err := expr.Compile(code, options...)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+
+	output, err := expr.Run(program, env)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+	fmt.Printf("%v", output)
+
+	// Output: [foo bar]
+}
+
+func ExamplePatch() {
+	/*
+		type patcher struct{}
+
+		func (p *patcher) Enter(_ *ast.Node) {}
+		func (p *patcher) Exit(node *ast.Node) {
+			switch n := (*node).(type) {
+			case *ast.PropertyNode:
+				ast.Patch(node, &ast.FunctionNode{
+					Name:      "get",
+					Arguments: []ast.Node{n.Node, &ast.StringNode{Value: n.Property}},
+				})
 			}
-			return date
+		}
+	*/
+
+	program, err := expr.Compile(
+		`greet.you.world + "!"`,
+		expr.Patch(&patcher{}),
+	)
+	if err != nil {
+		fmt.Printf("%v", err)
+		return
+	}
+
+	env := map[string]interface{}{
+		"greet": "Hello",
+		"get": func(a, b string) string {
+			return a + ", " + b
 		},
 	}
 
-	output, err := expr.Run(program, request)
+	output, err := expr.Run(program, env)
 	if err != nil {
 		fmt.Printf("%v", err)
 		return
 	}
-
 	fmt.Printf("%v", output)
 
-	// Output: true
+	// Output : Hello, you, world!
 }
 
-func ExampleEval_marshal() {
-	env := map[string]int{
-		"foo": 1,
-		"bar": 2,
+func TestOperator_struct(t *testing.T) {
+	env := &mockEnv{
+		BirthDay: time.Date(2017, time.October, 23, 18, 30, 0, 0, time.UTC),
 	}
 
-	program, err := expr.Compile("(foo + bar) in [1, 2, 3]", expr.Env(env))
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
+	code := `BirthDay == "2017-10-23"`
+
+	program, err := expr.Compile(code, expr.Env(&mockEnv{}), expr.Operator("==", "DateEqual"))
+	require.NoError(t, err)
+
+	output, err := expr.Run(program, env)
+	require.NoError(t, err)
+	require.Equal(t, true, output)
+}
+
+func TestOperator_interface(t *testing.T) {
+	env := &mockEnv{
+		Ticket: &ticket{Price: 100},
 	}
 
-	b, err := json.Marshal(program)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
+	code := `Ticket == "$100" && "$100" == Ticket && Now != Ticket && Now == Now`
+
+	program, err := expr.Compile(
+		code,
+		expr.Env(&mockEnv{}),
+		expr.Operator("==", "StringerStringEqual", "StringStringerEqual", "StringerStringerEqual"),
+		expr.Operator("!=", "NotStringerStringEqual", "NotStringStringerEqual", "NotStringerStringerEqual"),
+	)
+	require.NoError(t, err)
+
+	output, err := expr.Run(program, env)
+	require.NoError(t, err)
+	require.Equal(t, true, output)
+}
+
+func TestExpr_readme_example(t *testing.T) {
+	env := map[string]interface{}{
+		"greet":   "Hello, %v!",
+		"names":   []string{"world", "you"},
+		"sprintf": fmt.Sprintf,
 	}
 
-	unmarshaledProgram := &vm.Program{}
-	err = json.Unmarshal(b, unmarshaledProgram)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
+	code := `sprintf(greet, names[0])`
 
-	output, err := expr.Run(unmarshaledProgram, env)
-	if err != nil {
-		fmt.Printf("%v", err)
-		return
-	}
+	program, err := expr.Compile(code, expr.Env(env))
+	require.NoError(t, err)
 
-	fmt.Printf("%v", output)
+	output, err := expr.Run(program, env)
+	require.NoError(t, err)
 
-	// Output: true
+	require.Equal(t, "Hello, world!", output)
 }
 
 func TestExpr(t *testing.T) {
+	date := time.Date(2017, time.October, 23, 18, 30, 0, 0, time.UTC)
 	env := &mockEnv{
 		Any:     "any",
 		Int:     0,
@@ -422,7 +493,7 @@ func TestExpr(t *testing.T) {
 			{Origin: "MOW", Destination: "LED"},
 			{Origin: "LED", Destination: "MOW"},
 		},
-		BirthDay:      time.Date(2017, time.October, 23, 18, 30, 0, 0, time.UTC),
+		BirthDay:      date,
 		Now:           time.Now(),
 		One:           1,
 		Two:           2,
@@ -435,8 +506,9 @@ func TestExpr(t *testing.T) {
 			}
 			return ret
 		},
-		Inc: func(a int) int { return a + 1 },
-		Nil: nil,
+		Inc:    func(a int) int { return a + 1 },
+		Nil:    nil,
+		Tweets: []tweet{{"Oh My God!", date}, {"How you doin?", date}, {"Could I be wearing any more clothes?", date}},
 	}
 
 	tests := []struct {
@@ -652,6 +724,10 @@ func TestExpr(t *testing.T) {
 			true,
 		},
 		{
+			`count(1..30, {# % 3 == 0})`,
+			10,
+		},
+		{
 			`Now.After(BirthDay)`,
 			true,
 		},
@@ -743,36 +819,254 @@ func TestExpr(t *testing.T) {
 			`0 == nil || "str" == nil || true == nil`,
 			false,
 		},
+		{
+			`Variadic("head", 1, 2, 3)`,
+			[]int{1, 2, 3},
+		},
+		{
+			`Variadic("empty")`,
+			[]int{},
+		},
+		{
+			`String[:]`,
+			"string",
+		},
+		{
+			`String[:3]`,
+			"str",
+		},
+		{
+			`String[:9]`,
+			"string",
+		},
+		{
+			`String[3:9]`,
+			"ing",
+		},
+		{
+			`String[7:9]`,
+			"",
+		},
+		{
+			`Float(0)`,
+			float64(0),
+		},
+		{
+			`map(filter(Tweets, {len(.Text) > 10}), {Format(.Date)})`,
+			[]interface{}{"23 Oct 17 18:30 UTC", "23 Oct 17 18:30 UTC"},
+		},
+		{
+			`Concat("a", 1, [])`,
+			`a1[]`,
+		},
 	}
 
 	for _, tt := range tests {
 		program, err := expr.Compile(tt.code, expr.Env(&mockEnv{}))
-		require.NoError(t, err, tt.code)
+		require.NoError(t, err, "compile error")
 
 		got, err := expr.Run(program, env)
-		require.NoError(t, err, tt.code)
+		require.NoError(t, err, "execution error")
 
 		assert.Equal(t, tt.want, got, tt.code)
 	}
 
 	for _, tt := range tests {
 		program, err := expr.Compile(tt.code, expr.Optimize(false))
-		require.NoError(t, err, tt.code)
+		require.NoError(t, err, "compile error")
 
 		got, err := expr.Run(program, env)
-		require.NoError(t, err, tt.code)
+		require.NoError(t, err, "execution error")
 
 		assert.Equal(t, tt.want, got, "unoptimized: "+tt.code)
 	}
 
 	for _, tt := range tests {
 		got, err := expr.Eval(tt.code, env)
-		require.NoError(t, err, tt.code)
+		require.NoError(t, err, "eval error")
 
 		assert.Equal(t, tt.want, got, "eval: "+tt.code)
 	}
 }
 
+func TestExpr_eval_with_env(t *testing.T) {
+	_, err := expr.Eval("true", expr.Env(map[string]interface{}{}))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "misused")
+}
+
+func TestExpr_fetch_from_func(t *testing.T) {
+	_, err := expr.Eval("foo.Value", map[string]interface{}{
+		"foo": func() {},
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot fetch Value from func()")
+}
+
+func TestExpr_map_default_values(t *testing.T) {
+	env := map[string]interface{}{
+		"foo": map[string]string{},
+		"bar": map[string]*string{},
+	}
+
+	input := `foo['missing'] == '' && bar['missing'] == nil`
+
+	program, err := expr.Compile(input, expr.Env(env))
+	require.NoError(t, err)
+
+	output, err := expr.Run(program, env)
+	require.NoError(t, err)
+	require.Equal(t, true, output)
+}
+
+func TestExpr_map_default_values_compile_check(t *testing.T) {
+	tests := []struct {
+		env   interface{}
+		input string
+	}{
+		{
+			mockMapStringStringEnv{"foo": "bar"},
+			`Split(foo, sep)`,
+		},
+		{
+			mockMapStringIntEnv{"foo": 1},
+			`foo / bar`,
+		},
+	}
+	for _, tt := range tests {
+		_, err := expr.Compile(tt.input, expr.Env(tt.env), expr.AllowUndefinedVariables())
+		require.NoError(t, err)
+	}
+}
+
+func TestExpr_calls_with_nil(t *testing.T) {
+	env := map[string]interface{}{
+		"equals": func(a, b interface{}) interface{} {
+			assert.Nil(t, a, "a is not nil")
+			assert.Nil(t, b, "b is not nil")
+			return a == b
+		},
+		"is": is{},
+	}
+
+	p, err := expr.Compile(
+		"a == nil && equals(b, nil) && is.Nil(c)",
+		expr.Env(env),
+		expr.Operator("==", "equals"),
+		expr.AllowUndefinedVariables(),
+	)
+	require.NoError(t, err)
+
+	out, err := expr.Run(p, env)
+	require.NoError(t, err)
+	require.Equal(t, true, out)
+}
+
+func TestConstExpr_error(t *testing.T) {
+	env := map[string]interface{}{
+		"divide": func(a, b int) int { return a / b },
+	}
+
+	_, err := expr.Compile(
+		`1 + divide(1, 0)`,
+		expr.Env(env),
+		expr.ConstExpr("divide"),
+	)
+	require.Error(t, err)
+	require.Equal(t, "compile error: integer divide by zero (1:5)\n | 1 + divide(1, 0)\n | ....^", err.Error())
+}
+
+func TestConstExpr_error_wrong_type(t *testing.T) {
+	env := map[string]interface{}{
+		"divide": 0,
+	}
+
+	_, err := expr.Compile(
+		`1 + divide(1, 0)`,
+		expr.Env(env),
+		expr.ConstExpr("divide"),
+	)
+	require.Error(t, err)
+	require.Equal(t, "const expression \"divide\" must be a function", err.Error())
+}
+
+func TestConstExpr_error_no_env(t *testing.T) {
+	_, err := expr.Compile(
+		`1 + divide(1, 0)`,
+		expr.ConstExpr("divide"),
+	)
+	require.Error(t, err)
+	require.Equal(t, "no environment for const expression: divide", err.Error())
+}
+
+func TestPatch(t *testing.T) {
+	program, err := expr.Compile(
+		`Ticket == "$100" and "$90" != Ticket + "0"`,
+		expr.Env(mockEnv{}),
+		expr.Patch(&stringerPatcher{}),
+	)
+	require.NoError(t, err)
+
+	env := mockEnv{
+		Ticket: &ticket{Price: 100},
+	}
+	output, err := expr.Run(program, env)
+	require.NoError(t, err)
+	require.Equal(t, true, output)
+}
+
+func TestPatch_length(t *testing.T) {
+	program, err := expr.Compile(
+		`String.length == 5`,
+		expr.Env(mockEnv{}),
+		expr.Patch(&lengthPatcher{}),
+	)
+	require.NoError(t, err)
+
+	env := mockEnv{String: "hello"}
+	output, err := expr.Run(program, env)
+	require.NoError(t, err)
+	require.Equal(t, true, output)
+}
+
+func TestCompile_exposed_error(t *testing.T) {
+	_, err := expr.Compile(`1 == true`)
+	require.Error(t, err)
+
+	fileError, ok := err.(*file.Error)
+	require.True(t, ok, "error should be of type *file.Error")
+	require.Equal(t, "invalid operation: == (mismatched types int and bool) (1:3)\n | 1 == true\n | ..^", fileError.Error())
+	require.Equal(t, 2, fileError.Column)
+	require.Equal(t, 1, fileError.Line)
+
+	b, err := json.Marshal(err)
+	require.NoError(t, err)
+	require.Equal(t, `{"Line":1,"Column":2,"Message":"invalid operation: == (mismatched types int and bool)","Snippet":"\n | 1 == true\n | ..^"}`, string(b))
+}
+
+func TestAsBool_exposed_error_(t *testing.T) {
+	_, err := expr.Compile(`42`, expr.AsBool())
+	require.Error(t, err)
+
+	_, ok := err.(*file.Error)
+	require.False(t, ok, "error must not be of type *file.Error")
+	require.Equal(t, "expected bool, but got int", err.Error())
+}
+
+func TestEval_exposed_error(t *testing.T) {
+	_, err := expr.Eval(`1/0`, nil)
+	require.Error(t, err)
+
+	fileError, ok := err.(*file.Error)
+	require.True(t, ok, "error should be of type *file.Error")
+	require.Equal(t, "runtime error: integer divide by zero (1:2)\n | 1/0\n | .^", fileError.Error())
+	require.Equal(t, 1, fileError.Column)
+	require.Equal(t, 1, fileError.Line)
+}
+
+//
+// Mock types
+//
 type mockEnv struct {
 	Any                  interface{}
 	Int, One, Two, Three int
@@ -795,6 +1089,7 @@ type mockEnv struct {
 	NilStruct            *time.Time
 	NilInt               *int
 	NilSlice             []ticket
+	Tweets               []tweet
 }
 
 func (e *mockEnv) GetInt() int {
@@ -816,6 +1111,59 @@ func (*mockEnv) Duration(s string) time.Duration {
 func (*mockEnv) MapArg(m map[string]interface{}) string {
 	return m["foo"].(string)
 }
+
+func (*mockEnv) DateEqual(date time.Time, s string) bool {
+	return date.Format("2006-01-02") == s
+}
+
+func (*mockEnv) StringerStringEqual(f fmt.Stringer, s string) bool {
+	return f.String() == s
+}
+
+func (*mockEnv) StringStringerEqual(s string, f fmt.Stringer) bool {
+	return s == f.String()
+}
+
+func (*mockEnv) StringerStringerEqual(f fmt.Stringer, g fmt.Stringer) bool {
+	return f.String() == g.String()
+}
+
+func (*mockEnv) NotStringerStringEqual(f fmt.Stringer, s string) bool {
+	return f.String() != s
+}
+
+func (*mockEnv) NotStringStringerEqual(s string, f fmt.Stringer) bool {
+	return s != f.String()
+}
+
+func (*mockEnv) NotStringerStringerEqual(f fmt.Stringer, g fmt.Stringer) bool {
+	return f.String() != g.String()
+}
+
+func (*mockEnv) Variadic(x string, xs ...int) []int {
+	return xs
+}
+
+func (*mockEnv) Concat(list ...interface{}) string {
+	out := ""
+	for _, e := range list {
+		out += fmt.Sprintf("%v", e)
+	}
+	return out
+}
+
+func (*mockEnv) Float(i interface{}) float64 {
+	switch t := i.(type) {
+	case int:
+		return float64(t)
+	case float64:
+		return t
+	default:
+		panic("unexpected type")
+	}
+}
+
+func (*mockEnv) Format(t time.Time) string { return t.Format(time.RFC822) }
 
 type ticket struct {
 	Price int
@@ -839,4 +1187,70 @@ type segment struct {
 	Origin      string
 	Destination string
 	Date        time.Time
+}
+
+type tweet struct {
+	Text string
+	Date time.Time
+}
+
+type mockMapStringStringEnv map[string]string
+
+func (m mockMapStringStringEnv) Split(s, sep string) []string {
+	return strings.Split(s, sep)
+}
+
+type mockMapStringIntEnv map[string]int
+
+type is struct{}
+
+func (is) Nil(a interface{}) bool {
+	return a == nil
+}
+
+type patcher struct{}
+
+func (p *patcher) Enter(_ *ast.Node) {}
+func (p *patcher) Exit(node *ast.Node) {
+	switch n := (*node).(type) {
+	case *ast.PropertyNode:
+		ast.Patch(node, &ast.FunctionNode{
+			Name:      "get",
+			Arguments: []ast.Node{n.Node, &ast.StringNode{Value: n.Property}},
+		})
+	}
+}
+
+var stringer = reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
+
+type stringerPatcher struct{}
+
+func (p *stringerPatcher) Enter(_ *ast.Node) {}
+func (p *stringerPatcher) Exit(node *ast.Node) {
+	t := (*node).Type()
+	if t == nil {
+		return
+	}
+	if t.Implements(stringer) {
+		ast.Patch(node, &ast.MethodNode{
+			Node:   *node,
+			Method: "String",
+		})
+	}
+
+}
+
+type lengthPatcher struct{}
+
+func (p *lengthPatcher) Enter(_ *ast.Node) {}
+func (p *lengthPatcher) Exit(node *ast.Node) {
+	switch n := (*node).(type) {
+	case *ast.PropertyNode:
+		if n.Property == "length" {
+			ast.Patch(node, &ast.BuiltinNode{
+				Name:      "len",
+				Arguments: []ast.Node{n.Node},
+			})
+		}
+	}
 }

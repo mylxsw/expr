@@ -7,7 +7,6 @@ import (
 
 	"github.com/antonmedv/expr/ast"
 	"github.com/antonmedv/expr/parser"
-	"github.com/sanity-io/litter"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -21,16 +20,8 @@ func TestParse(t *testing.T) {
 			&ast.IdentifierNode{Value: "a"},
 		},
 		{
-			`"\"double\""`,
-			&ast.StringNode{Value: "\"double\""},
-		},
-		{
-			`'\'single\\ \''`,
-			&ast.StringNode{Value: "'single\\ '"},
-		},
-		{
-			`"\xC3\XBF\u263A\U000003A8\?"`,
-			&ast.StringNode{Value: "Ã¿☺Ψ?"},
+			`"str"`,
+			&ast.StringNode{Value: "str"},
 		},
 		{
 			"3",
@@ -42,11 +33,15 @@ func TestParse(t *testing.T) {
 		},
 		{
 			"10_000_000",
-			&ast.IntegerNode{Value: 10000000},
+			&ast.IntegerNode{Value: 10_000_000},
 		},
 		{
 			"2.5",
 			&ast.FloatNode{Value: 2.5},
+		},
+		{
+			"1e9",
+			&ast.FloatNode{Value: 1e9},
 		},
 		{
 			"true",
@@ -54,7 +49,7 @@ func TestParse(t *testing.T) {
 		},
 		{
 			"false",
-			&ast.BoolNode{},
+			&ast.BoolNode{Value: false},
 		},
 		{
 			"nil",
@@ -148,6 +143,10 @@ func TestParse(t *testing.T) {
 			&ast.MapNode{Pairs: []ast.Node{&ast.PairNode{Key: &ast.StringNode{Value: "foo"}, Value: &ast.IntegerNode{Value: 1}}, &ast.PairNode{Key: &ast.StringNode{Value: "bar"}, Value: &ast.IntegerNode{Value: 2}}}},
 		},
 		{
+			"{foo:1, bar:2, }",
+			&ast.MapNode{Pairs: []ast.Node{&ast.PairNode{Key: &ast.StringNode{Value: "foo"}, Value: &ast.IntegerNode{Value: 1}}, &ast.PairNode{Key: &ast.StringNode{Value: "bar"}, Value: &ast.IntegerNode{Value: 2}}}},
+		},
+		{
 			`{"a": 1, 'b': 2}`,
 			&ast.MapNode{Pairs: []ast.Node{&ast.PairNode{Key: &ast.StringNode{Value: "a"}, Value: &ast.IntegerNode{Value: 1}}, &ast.PairNode{Key: &ast.StringNode{Value: "b"}, Value: &ast.IntegerNode{Value: 2}}}},
 		},
@@ -196,8 +195,36 @@ func TestParse(t *testing.T) {
 			&ast.BuiltinNode{Name: "all", Arguments: []ast.Node{&ast.IdentifierNode{Value: "Tickets"}, &ast.ClosureNode{Node: &ast.BinaryNode{Operator: ">", Left: &ast.PropertyNode{Node: &ast.PointerNode{}, Property: "Price"}, Right: &ast.IntegerNode{Value: 0}}}}},
 		},
 		{
+			"one(Tickets, {#.Price > 0})",
+			&ast.BuiltinNode{Name: "one", Arguments: []ast.Node{&ast.IdentifierNode{Value: "Tickets"}, &ast.ClosureNode{Node: &ast.BinaryNode{Operator: ">", Left: &ast.PropertyNode{Node: &ast.PointerNode{}, Property: "Price"}, Right: &ast.IntegerNode{Value: 0}}}}},
+		},
+		{
+			"filter(Prices, {# > 100})",
+			&ast.BuiltinNode{Name: "filter", Arguments: []ast.Node{&ast.IdentifierNode{Value: "Prices"}, &ast.ClosureNode{Node: &ast.BinaryNode{Operator: ">", Left: &ast.PointerNode{}, Right: &ast.IntegerNode{Value: 100}}}}},
+		},
+		{
 			"array[1:2]",
 			&ast.SliceNode{Node: &ast.IdentifierNode{Value: "array"}, From: &ast.IntegerNode{Value: 1}, To: &ast.IntegerNode{Value: 2}},
+		},
+		{
+			"array[:2]",
+			&ast.SliceNode{Node: &ast.IdentifierNode{Value: "array"}, To: &ast.IntegerNode{Value: 2}},
+		},
+		{
+			"array[1:]",
+			&ast.SliceNode{Node: &ast.IdentifierNode{Value: "array"}, From: &ast.IntegerNode{Value: 1}},
+		},
+		{
+			"array[:]",
+			&ast.SliceNode{Node: &ast.IdentifierNode{Value: "array"}},
+		},
+		{
+			"[]",
+			&ast.ArrayNode{},
+		},
+		{
+			"[1, 2, 3,]",
+			&ast.ArrayNode{Nodes: []ast.Node{&ast.IntegerNode{Value: 1}, &ast.IntegerNode{Value: 2}, &ast.IntegerNode{Value: 3}}},
 		},
 	}
 	for _, test := range parseTests {
@@ -210,63 +237,89 @@ func TestParse(t *testing.T) {
 			m.Regexp = nil
 			actual.Node = m
 		}
-		assert.Equal(t, litter.Sdump(test.expected), litter.Sdump(actual.Node), test.input)
+		assert.Equal(t, ast.Dump(test.expected), ast.Dump(actual.Node), test.input)
 	}
 }
 
+const errorTests = `
+foo.
+unexpected end of expression (1:4)
+ | foo.
+ | ...^
+
+a+
+unexpected token EOF (1:2)
+ | a+
+ | .^
+
+a ? (1+2) c
+unexpected token Identifier("c") (1:11)
+ | a ? (1+2) c
+ | ..........^
+
+[a b]
+unexpected token Identifier("b") (1:4)
+ | [a b]
+ | ...^
+
+foo.bar(a b)
+unexpected token Identifier("b") (1:11)
+ | foo.bar(a b)
+ | ..........^
+
+{-}
+a map key must be a quoted string, a number, a identifier, or an expression enclosed in parentheses (unexpected token Operator("-")) (1:2)
+ | {-}
+ | .^
+
+a matches 'a:)b'
+error parsing regexp: unexpected ): ` + "`a:)b`" + ` (1:16)
+ | a matches 'a:)b'
+ | ...............^
+
+foo({.bar})
+a map key must be a quoted string, a number, a identifier, or an expression enclosed in parentheses (unexpected token Operator(".")) (1:6)
+ | foo({.bar})
+ | .....^
+
+.foo
+cannot use pointer accessor outside closure (1:1)
+ | .foo
+ | ^
+
+[1, 2, 3,,]
+unexpected token Operator(",") (1:10)
+ | [1, 2, 3,,]
+ | .........^
+
+[,]
+unexpected token Operator(",") (1:2)
+ | [,]
+ | .^
+
+{,}
+a map key must be a quoted string, a number, a identifier, or an expression enclosed in parentheses (unexpected token Operator(",")) (1:2)
+ | {,}
+ | .^
+
+{foo:1, bar:2, ,}
+unexpected token Operator(",") (1:16)
+ | {foo:1, bar:2, ,}
+ | ...............^
+`
+
 func TestParse_error(t *testing.T) {
-	var parseErrorTests = []struct {
-		input string
-		err   string
-	}{
-		{
-			"foo.",
-			"syntax error: missing Identifier at",
-		},
-		{
-			"a+",
-			"syntax error: mismatched input '<EOF>'",
-		},
-		{
-			"a ? (1+2) c",
-			"syntax error: missing ':' at 'c'",
-		},
-		{
-			"[a b]",
-			"syntax error: extraneous input 'b' expecting {']', ','}",
-		},
-		{
-			"foo.bar(a b)",
-			"syntax error: extraneous input 'b' expecting ')'",
-		},
-		{
-			"{-}",
-			"syntax error: no viable alternative at input '{-'",
-		},
-		{
-			"a matches 'a)(b'",
-			"error parsing regexp: unexpected )",
-		},
-		{
-			`a matches "*"`,
-			"error parsing regexp: missing argument to repetition operator: `*` (1:11)\n | a matches \"*\"\n | ..........^",
-		},
-		{
-			`.foo`,
-			"parse error: dot property accessor can be only inside closure",
-		},
-		{
-			`foo({.bar})`,
-			"syntax error: no viable alternative at input '{.'",
-		},
-	}
-	for _, test := range parseErrorTests {
-		_, err := parser.Parse(test.input)
+	tests := strings.Split(strings.Trim(errorTests, "\n"), "\n\n")
+	for _, test := range tests {
+		input := strings.SplitN(test, "\n", 2)
+		if len(input) != 2 {
+			t.Errorf("syntax error in test: %q", test)
+			break
+		}
+		_, err := parser.Parse(input[0])
 		if err == nil {
 			err = fmt.Errorf("<nil>")
 		}
-		if !strings.Contains(err.Error(), test.err) || test.err == "" {
-			assert.Equal(t, test.err, err.Error(), test.input)
-		}
+		assert.Equal(t, input[1], err.Error(), input[0])
 	}
 }

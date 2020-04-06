@@ -8,26 +8,36 @@ syntaxes.
 The package supports:
 
 * **strings** - single and double quotes (e.g. `"hello"`, `'hello'`)
-* **numbers** - e.g. `103`, `2.5`
+* **numbers** - e.g. `103`, `2.5`, `.5`
 * **arrays** - e.g. `[1, 2, 3]`
 * **maps** - e.g. `{foo: "bar"}`
 * **booleans** - `true` and `false`
 * **nil** - `nil`
+
+## Digit separators
+
+Integer literals may contain digit separators to allow digit grouping into more legible forms.
+
+Example:
+
+```
+10_000_000_000
+```
 
 ## Accessing Public Properties
 
 Public properties on structs can be accessed by using the `.` syntax. 
 If you pass an array into an expression, use the `[]` syntax to access array keys.
 
-```coffeescript
+```js
 foo.Array[0].Value
 ```
 
-## Calling Methods
+## Functions and Methods
 
-The `.` syntax can also be used to call methods on an struct.
+Functions may be called using `()` syntax. The `.` syntax can also be used to call methods on an struct.
 
-```coffeescript
+```js
 price.String()
 ```
 
@@ -46,19 +56,9 @@ The package comes with a lot of operators:
 
 Example:
 
-```coffeescript
+```js
 life + universe + everything
 ``` 
-
-### Digit separators
-
-Integer literals may contain digit separators to allow digit grouping into more legible forms.
-
-Example:
-
-```
-10_000_000_000
-```
 
 ### Comparison Operators
 
@@ -91,7 +91,7 @@ life < universe || life < everything
 
 To test if a string does *not* match a regex, use the logical `not` operator in combination with the `matches` operator:
 
-```coffeescript
+```js
 not ("foo" matches "^b.+")
 ```
 
@@ -99,7 +99,7 @@ You must use parenthesis because the unary operator `not` has precedence over th
 
 Example:
 
-```coffeescript
+```js
 'Arthur' + ' ' + 'Dent'
 ```
 
@@ -112,11 +112,11 @@ Result will be set to `Arthur Dent`.
 
 Example:
 
-```coffeescript
+```js
 user.Group in ["human_resources", "marketing"]
 ```
 
-```coffeescript
+```js
 "foo" in {foo: 1, bar: 2}
 ```
 
@@ -126,13 +126,13 @@ user.Group in ["human_resources", "marketing"]
 
 Example:
 
-```coffeescript
+```js
 user.Age in 18..45
 ```
 
 The range is inclusive:
 
-```coffeescript
+```js
 1..3 == [1, 2, 3]
 ```
 
@@ -142,7 +142,7 @@ The range is inclusive:
 
 Example:
 
-```coffeescript
+```js
 user.Age > 30 ? "mature" : "immature"
 ```
 
@@ -155,12 +155,20 @@ user.Age > 30 ? "mature" : "immature"
 * `one` (will return `true` if exactly ONE element satisfies the predicate)
 * `filter` (filter array by the predicate)
 * `map` (map all items with the closure)
+* `count` (returns number of elements what satisfies the predicate)
 
-Example:
+Examples:
 
-```go
-// Ensure all tweets are less than 140 chars.
-all(Tweets, {.Size < 140})
+Ensure all tweets are less than 280 chars.
+
+```js
+all(Tweets, {.Size < 280})
+```
+
+Ensure there is exactly one winner.
+
+```js
+one(Participants, {.Winner})
 ```
 
 ## Closures
@@ -169,14 +177,14 @@ all(Tweets, {.Size < 140})
 
 Closures allowed only with builtin functions. To access current item use `#` symbol.
 
-```go
-map(0..9, {# + 1})
+```js
+map(0..9, {# / 2})
 ```
 
 If the item of array is struct, it's possible to access fields of struct with omitted `#` symbol (`#.Value` becomes `.Value`).
 
-```go
-filter(Tweets, {.Size > 140})
+```js
+filter(Tweets, {len(.Value) > 280})
 ```
 
 ## Slices
@@ -187,8 +195,9 @@ Slices can work with arrays or strings.
 
 Example:
 
-```go
-// array is [1,2,3,4,5]
+Variable `array` is `[1,2,3,4,5]`.
+
+```js
 array[1:5] == [2,3,4] 
 array[3:] == [4,5]
 array[:4] == [1,2,3]

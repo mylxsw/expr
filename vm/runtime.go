@@ -17,19 +17,32 @@ type Scope map[string]interface{}
 
 func fetch(from interface{}, i interface{}) interface{} {
 	v := reflect.ValueOf(from)
-	switch v.Kind() {
+	kind := v.Kind()
+
+	// Structures can be access through a pointer or through a value, when they
+	// are accessed through a pointer we don't want to copy them to a value.
+	if kind == reflect.Ptr && reflect.Indirect(v).Kind() == reflect.Struct {
+		v = reflect.Indirect(v)
+		kind = v.Kind()
+	}
+
+	switch kind {
 
 	case reflect.Array, reflect.Slice, reflect.String:
-		index := toInt(i)
-		value := v.Index(int(index))
+		value := v.Index(toInt(i))
 		if value.IsValid() && value.CanInterface() {
 			return value.Interface()
 		}
 
 	case reflect.Map:
 		value := v.MapIndex(reflect.ValueOf(i))
-		if value.IsValid() && value.CanInterface() {
-			return value.Interface()
+		if value.IsValid() {
+			if value.CanInterface() {
+				return value.Interface()
+			}
+		} else {
+			elem := reflect.TypeOf(from).Elem()
+			return reflect.Zero(elem).Interface()
 		}
 
 	case reflect.Struct:
@@ -37,23 +50,27 @@ func fetch(from interface{}, i interface{}) interface{} {
 		if value.IsValid() && value.CanInterface() {
 			return value.Interface()
 		}
-
-	case reflect.Ptr:
-		value := v.Elem()
-		if value.IsValid() && value.CanInterface() {
-			return fetch(value.Interface(), i)
-		}
-
 	}
-	return nil
+
+	panic(fmt.Sprintf("cannot fetch %v from %T", i, from))
 }
 
 func slice(array, from, to interface{}) interface{} {
 	v := reflect.ValueOf(array)
-	switch v.Kind() {
 
+	switch v.Kind() {
 	case reflect.Array, reflect.Slice, reflect.String:
-		value := v.Slice(toInt(from), toInt(to))
+		length := v.Len()
+		a, b := toInt(from), toInt(to)
+
+		if b > length {
+			b = length
+		}
+		if a > b {
+			a = b
+		}
+
+		value := v.Slice(a, b)
 		if value.IsValid() && value.CanInterface() {
 			return value.Interface()
 		}
@@ -68,7 +85,7 @@ func slice(array, from, to interface{}) interface{} {
 	panic(fmt.Sprintf("cannot slice %v", from))
 }
 
-func fetchFn(from interface{}, name string) reflect.Value {
+func FetchFn(from interface{}, name string) reflect.Value {
 	v := reflect.ValueOf(from)
 
 	// Methods can be defined on any type.
@@ -201,9 +218,7 @@ func exponent(a, b interface{}) float64 {
 	return math.Pow(toFloat64(a), toFloat64(b))
 }
 
-func makeRange(a, b interface{}) []int {
-	min := toInt(a)
-	max := toInt(b)
+func makeRange(min, max int) []int {
 	size := max - min + 1
 	rng := make([]int, size)
 	for i := range rng {
@@ -220,7 +235,7 @@ func toInt(a interface{}) int {
 		return int(x)
 
 	case int:
-		return int(x)
+		return x
 	case int8:
 		return int(x)
 	case int16:
@@ -262,7 +277,7 @@ func toInt64(a interface{}) int64 {
 	case int32:
 		return int64(x)
 	case int64:
-		return int64(x)
+		return x
 
 	case uint:
 		return int64(x)

@@ -5,22 +5,12 @@ import (
 	"reflect"
 
 	"github.com/antonmedv/expr/ast"
-	"github.com/antonmedv/expr/internal/conf"
-	"github.com/antonmedv/expr/internal/file"
+	"github.com/antonmedv/expr/conf"
+	"github.com/antonmedv/expr/file"
 	"github.com/antonmedv/expr/parser"
 )
 
-func Check(tree *parser.Tree, config *conf.Config) (t reflect.Type, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			if h, ok := r.(file.Error); ok {
-				err = fmt.Errorf("%v", h.Format(tree.Source))
-			} else {
-				err = fmt.Errorf("%v", r)
-			}
-		}
-	}()
-
+func Check(tree *parser.Tree, config *conf.Config) (reflect.Type, error) {
 	v := &visitor{
 		collections: make([]reflect.Type, 0),
 	}
@@ -28,26 +18,30 @@ func Check(tree *parser.Tree, config *conf.Config) (t reflect.Type, err error) {
 		v.types = config.Types
 		v.operators = config.Operators
 		v.expect = config.Expect
+		v.strict = config.Strict
+		v.defaultType = config.DefaultType
 	}
 
-	t = v.visit(tree.Node)
+	t := v.visit(tree.Node)
 
 	if v.expect != reflect.Invalid {
 		switch v.expect {
 		case reflect.Int64, reflect.Float64:
-			if isNumber(t) {
-				goto okay
+			if !isNumber(t) {
+				return nil, fmt.Errorf("expected %v, but got %v", v.expect, t)
 			}
 		default:
-			if t.Kind() == v.expect {
-				goto okay
+			if t.Kind() != v.expect {
+				return nil, fmt.Errorf("expected %v, but got %v", v.expect, t)
 			}
 		}
-		return nil, fmt.Errorf("expected %v, but got %v", v.expect, t)
 	}
 
-okay:
-	return
+	if v.err != nil {
+		return t, v.err.Bind(tree.Source)
+	}
+
+	return t, nil
 }
 
 type visitor struct {
@@ -55,6 +49,9 @@ type visitor struct {
 	operators   conf.OperatorsTable
 	expect      reflect.Kind
 	collections []reflect.Type
+	strict      bool
+	defaultType reflect.Type
+	err         *file.Error
 }
 
 func (v *visitor) visit(node ast.Node) reflect.Type {
@@ -109,14 +106,17 @@ func (v *visitor) visit(node ast.Node) reflect.Type {
 	return t
 }
 
-func (v *visitor) error(node ast.Node, format string, args ...interface{}) file.Error {
-	return file.Error{
-		Location: node.GetLocation(),
-		Message:  fmt.Sprintf(format, args...),
+func (v *visitor) error(node ast.Node, format string, args ...interface{}) reflect.Type {
+	if v.err == nil { // show first error
+		v.err = &file.Error{
+			Location: node.Location(),
+			Message:  fmt.Sprintf(format, args...),
+		}
 	}
+	return interfaceType // interface represent undefined type
 }
 
-func (v *visitor) NilNode(node *ast.NilNode) reflect.Type {
+func (v *visitor) NilNode(*ast.NilNode) reflect.Type {
 	return nilType
 }
 
@@ -127,22 +127,28 @@ func (v *visitor) IdentifierNode(node *ast.IdentifierNode) reflect.Type {
 	if t, ok := v.types[node.Value]; ok {
 		return t.Type
 	}
-	panic(v.error(node, "unknown name %v", node.Value))
+	if !v.strict {
+		if v.defaultType != nil {
+			return v.defaultType
+		}
+		return interfaceType
+	}
+	return v.error(node, "unknown name %v", node.Value)
 }
 
-func (v *visitor) IntegerNode(node *ast.IntegerNode) reflect.Type {
+func (v *visitor) IntegerNode(*ast.IntegerNode) reflect.Type {
 	return integerType
 }
 
-func (v *visitor) FloatNode(node *ast.FloatNode) reflect.Type {
+func (v *visitor) FloatNode(*ast.FloatNode) reflect.Type {
 	return floatType
 }
 
-func (v *visitor) BoolNode(node *ast.BoolNode) reflect.Type {
+func (v *visitor) BoolNode(*ast.BoolNode) reflect.Type {
 	return boolType
 }
 
-func (v *visitor) StringNode(node *ast.StringNode) reflect.Type {
+func (v *visitor) StringNode(*ast.StringNode) reflect.Type {
 	return stringType
 }
 
@@ -162,10 +168,10 @@ func (v *visitor) UnaryNode(node *ast.UnaryNode) reflect.Type {
 		}
 
 	default:
-		panic(v.error(node, "unknown operator (%v)", node.Operator))
+		return v.error(node, "unknown operator (%v)", node.Operator)
 	}
 
-	panic(v.error(node, `invalid operation: %v (mismatched type %v)`, node.Operator, t))
+	return v.error(node, `invalid operation: %v (mismatched type %v)`, node.Operator, t)
 }
 
 func (v *visitor) BinaryNode(node *ast.BinaryNode) reflect.Type {
@@ -174,15 +180,9 @@ func (v *visitor) BinaryNode(node *ast.BinaryNode) reflect.Type {
 
 	// check operator overloading
 	if fns, ok := v.operators[node.Operator]; ok {
-		for _, fn := range fns {
-			fnType := v.types[fn]
-
-			firstArgType := fnType.Type.In(0)
-			secondArgType := fnType.Type.In(1)
-
-			if l == firstArgType && r == secondArgType {
-				return fnType.Type.Out(0)
-			}
+		t, _, ok := conf.FindSuitableOperatorOverload(fns, v.types, l, r)
+		if ok {
+			return t
 		}
 	}
 
@@ -249,15 +249,15 @@ func (v *visitor) BinaryNode(node *ast.BinaryNode) reflect.Type {
 
 	case "..":
 		if isInteger(l) && isInteger(r) {
-			return arrayType
+			return reflect.SliceOf(integerType)
 		}
 
 	default:
-		panic(v.error(node, "unknown operator (%v)", node.Operator))
+		return v.error(node, "unknown operator (%v)", node.Operator)
 
 	}
 
-	panic(v.error(node, `invalid operation: %v (mismatched types %v and %v)`, node.Operator, l, r))
+	return v.error(node, `invalid operation: %v (mismatched types %v and %v)`, node.Operator, l, r)
 }
 
 func (v *visitor) MatchesNode(node *ast.MatchesNode) reflect.Type {
@@ -268,7 +268,7 @@ func (v *visitor) MatchesNode(node *ast.MatchesNode) reflect.Type {
 		return boolType
 	}
 
-	panic(v.error(node, `invalid operation: matches (mismatched types %v and %v)`, l, r))
+	return v.error(node, `invalid operation: matches (mismatched types %v and %v)`, l, r)
 }
 
 func (v *visitor) PropertyNode(node *ast.PropertyNode) reflect.Type {
@@ -278,7 +278,7 @@ func (v *visitor) PropertyNode(node *ast.PropertyNode) reflect.Type {
 		return t
 	}
 
-	panic(v.error(node, "type %v has no field %v", t, node.Property))
+	return v.error(node, "type %v has no field %v", t, node.Property)
 }
 
 func (v *visitor) IndexNode(node *ast.IndexNode) reflect.Type {
@@ -287,151 +287,149 @@ func (v *visitor) IndexNode(node *ast.IndexNode) reflect.Type {
 
 	if t, ok := indexType(t); ok {
 		if !isInteger(i) && !isString(i) {
-			panic(v.error(node, "invalid operation: cannot use %v as index to %v", i, t))
+			return v.error(node, "invalid operation: cannot use %v as index to %v", i, t)
 		}
 		return t
 	}
 
-	panic(v.error(node, "invalid operation: type %v does not support indexing", t))
+	return v.error(node, "invalid operation: type %v does not support indexing", t)
 }
 
 func (v *visitor) SliceNode(node *ast.SliceNode) reflect.Type {
 	t := v.visit(node.Node)
 
-	if _, ok := indexType(t); ok {
+	_, isIndex := indexType(t)
+
+	if isIndex || isString(t) {
 		if node.From != nil {
 			from := v.visit(node.From)
 			if !isInteger(from) {
-				panic(v.error(node.From, "invalid operation: non-integer slice index %v", from))
+				return v.error(node.From, "invalid operation: non-integer slice index %v", from)
 			}
 		}
 		if node.To != nil {
 			to := v.visit(node.To)
 			if !isInteger(to) {
-				panic(v.error(node.To, "invalid operation: non-integer slice index %v", to))
+				return v.error(node.To, "invalid operation: non-integer slice index %v", to)
 			}
 		}
 		return t
 	}
 
-	panic(v.error(node, "invalid operation: cannot slice %v", t))
+	return v.error(node, "invalid operation: cannot slice %v", t)
 }
 
 func (v *visitor) FunctionNode(node *ast.FunctionNode) reflect.Type {
 	if f, ok := v.types[node.Name]; ok {
 		if fn, ok := isFuncType(f.Type); ok {
-			if isInterface(fn) {
-				return interfaceType
-			}
 
-			if fn.NumOut() == 0 {
-				panic(v.error(node, "func %v doesn't return value", node.Name))
-			}
-			if fn.NumOut() != 1 {
-				panic(v.error(node, "func %v returns more then one value", node.Name))
-			}
-
-			numIn := fn.NumIn()
-
-			// If func is method on an env, first argument should be a receiver,
-			// and actual arguments less then numIn by one.
+			inputParamsCount := 1 // for functions
 			if f.Method {
-				numIn--
+				inputParamsCount = 2 // for methods
 			}
 
-			if len(node.Arguments) > numIn {
-				panic(v.error(node, "too many arguments to call %v", node.Name))
-			}
-			if len(node.Arguments) < numIn {
-				panic(v.error(node, "not enough arguments to call %v", node.Name))
-			}
-
-			n := 0
-
-			// Skip first argument in case of the receiver.
-			if f.Method {
-				n = 1
-			}
-
-			for _, arg := range node.Arguments {
-				t := v.visit(arg)
-				in := fn.In(n)
-
-				if isIntegerOrArithmeticOperation(arg) {
-					t = in
-					setTypeForIntegers(arg, t)
+			if !isInterface(fn) &&
+				fn.IsVariadic() &&
+				fn.NumIn() == inputParamsCount &&
+				fn.NumOut() == 1 &&
+				fn.Out(0).Kind() == reflect.Interface {
+				rest := fn.In(fn.NumIn() - 1) // function has only one param for functions and two for methods
+				if rest.Kind() == reflect.Slice && rest.Elem().Kind() == reflect.Interface {
+					node.Fast = true
 				}
-
-				if !t.AssignableTo(in) {
-					panic(v.error(arg, "cannot use %v as argument (type %v) to call %v ", t, in, node.Name))
-				}
-				n++
 			}
 
-			return fn.Out(0)
-
+			return v.checkFunc(fn, f.Method, node, node.Name, node.Arguments)
 		}
 	}
-	panic(v.error(node, "unknown func %v", node.Name))
+	if !v.strict {
+		if v.defaultType != nil {
+			return v.defaultType
+		}
+		return interfaceType
+	}
+	return v.error(node, "unknown func %v", node.Name)
 }
 
 func (v *visitor) MethodNode(node *ast.MethodNode) reflect.Type {
 	t := v.visit(node.Node)
 	if f, method, ok := methodType(t, node.Method); ok {
 		if fn, ok := isFuncType(f); ok {
-			if isInterface(fn) {
-				return interfaceType
-			}
-
-			if fn.NumOut() == 0 {
-				panic(v.error(node, "method %v doesn't return value", node.Method))
-			}
-			if fn.NumOut() != 1 {
-				panic(v.error(node, "method %v returns more then one value", node.Method))
-			}
-
-			numIn := fn.NumIn()
-
-			// If func is method, first argument should be a receiver,
-			// and actual arguments less then numIn by one.
-			if method {
-				numIn--
-			}
-
-			if len(node.Arguments) > numIn {
-				panic(v.error(node, "too many arguments to call %v", node.Method))
-			}
-			if len(node.Arguments) < numIn {
-				panic(v.error(node, "not enough arguments to call %v", node.Method))
-			}
-
-			n := 0
-
-			// Skip first argument in case of the receiver.
-			if method {
-				n = 1
-			}
-
-			for _, arg := range node.Arguments {
-				t := v.visit(arg)
-				in := fn.In(n)
-
-				if isIntegerOrArithmeticOperation(arg) {
-					t = in
-					setTypeForIntegers(arg, t)
-				}
-
-				if !t.AssignableTo(in) {
-					panic(v.error(arg, "cannot use %v as argument (type %v) to call %v ", t, in, node.Method))
-				}
-				n++
-			}
-
-			return fn.Out(0)
-
+			return v.checkFunc(fn, method, node, node.Method, node.Arguments)
 		}
 	}
-	panic(v.error(node, "type %v has no method %v", t, node.Method))
+	return v.error(node, "type %v has no method %v", t, node.Method)
+}
+
+// checkFunc checks func arguments and returns "return type" of func or method.
+func (v *visitor) checkFunc(fn reflect.Type, method bool, node ast.Node, name string, arguments []ast.Node) reflect.Type {
+	if isInterface(fn) {
+		return interfaceType
+	}
+
+	if fn.NumOut() == 0 {
+		return v.error(node, "func %v doesn't return value", name)
+	}
+	if fn.NumOut() != 1 {
+		return v.error(node, "func %v returns more then one value", name)
+	}
+
+	numIn := fn.NumIn()
+
+	// If func is method on an env, first argument should be a receiver,
+	// and actual arguments less then numIn by one.
+	if method {
+		numIn--
+	}
+
+	if fn.IsVariadic() {
+		if len(arguments) < numIn-1 {
+			return v.error(node, "not enough arguments to call %v", name)
+		}
+	} else {
+		if len(arguments) > numIn {
+			return v.error(node, "too many arguments to call %v", name)
+		}
+		if len(arguments) < numIn {
+			return v.error(node, "not enough arguments to call %v", name)
+		}
+	}
+
+	offset := 0
+
+	// Skip first argument in case of the receiver.
+	if method {
+		offset = 1
+	}
+
+	for i, arg := range arguments {
+		t := v.visit(arg)
+
+		var in reflect.Type
+		if fn.IsVariadic() && i >= numIn-1 {
+			// For variadic arguments fn(xs ...int), go replaces type of xs (int) with ([]int).
+			// As we compare arguments one by one, we need underling type.
+			in = fn.In(fn.NumIn() - 1)
+			in, _ = indexType(in)
+		} else {
+			in = fn.In(i + offset)
+		}
+
+		if isIntegerOrArithmeticOperation(arg) {
+			t = in
+			setTypeForIntegers(arg, t)
+		}
+
+		if t == nil {
+			continue
+		}
+
+		if !t.AssignableTo(in) && t.Kind() != reflect.Interface {
+			return v.error(arg, "cannot use %v as argument (type %v) to call %v ", t, in, name)
+		}
+	}
+
+	return fn.Out(0)
 }
 
 func (v *visitor) BuiltinNode(node *ast.BuiltinNode) reflect.Type {
@@ -442,67 +440,94 @@ func (v *visitor) BuiltinNode(node *ast.BuiltinNode) reflect.Type {
 		if isArray(param) || isMap(param) || isString(param) {
 			return integerType
 		}
-		panic(v.error(node, "invalid argument for len (type %v)", param))
+		return v.error(node, "invalid argument for len (type %v)", param)
 
 	case "all", "none", "any", "one":
 		collection := v.visit(node.Arguments[0])
+		if !isArray(collection) {
+			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
+		}
 
 		v.collections = append(v.collections, collection)
 		closure := v.visit(node.Arguments[1])
 		v.collections = v.collections[:len(v.collections)-1]
 
-		if isArray(collection) {
-			if isFunc(closure) &&
-				closure.NumOut() == 1 && isBool(closure.Out(0)) &&
-				closure.NumIn() == 1 && isInterface(closure.In(0)) {
+		if isFunc(closure) &&
+			closure.NumOut() == 1 &&
+			closure.NumIn() == 1 && isInterface(closure.In(0)) {
 
-				return boolType
-
+			if !isBool(closure.Out(0)) {
+				return v.error(node.Arguments[1], "closure should return boolean (got %v)", closure.Out(0).String())
 			}
-			panic(v.error(node.Arguments[1], "closure should return bool"))
+			return boolType
 		}
-		panic(v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection))
+		return v.error(node.Arguments[1], "closure should has one input and one output param")
 
 	case "filter":
 		collection := v.visit(node.Arguments[0])
+		if !isArray(collection) {
+			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
+		}
 
 		v.collections = append(v.collections, collection)
 		closure := v.visit(node.Arguments[1])
 		v.collections = v.collections[:len(v.collections)-1]
 
-		if isArray(collection) {
-			if isFunc(closure) &&
-				closure.NumOut() == 1 && isBool(closure.Out(0)) &&
-				closure.NumIn() == 1 && isInterface(closure.In(0)) {
+		if isFunc(closure) &&
+			closure.NumOut() == 1 &&
+			closure.NumIn() == 1 && isInterface(closure.In(0)) {
 
-				return collection
-
+			if !isBool(closure.Out(0)) {
+				return v.error(node.Arguments[1], "closure should return boolean (got %v)", closure.Out(0).String())
 			}
-			panic(v.error(node.Arguments[1], "closure should return bool"))
+			if isInterface(collection) {
+				return arrayType
+			}
+			return reflect.SliceOf(collection.Elem())
 		}
-		panic(v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection))
+		return v.error(node.Arguments[1], "closure should has one input and one output param")
 
 	case "map":
 		collection := v.visit(node.Arguments[0])
+		if !isArray(collection) {
+			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
+		}
 
 		v.collections = append(v.collections, collection)
 		closure := v.visit(node.Arguments[1])
 		v.collections = v.collections[:len(v.collections)-1]
 
-		if isArray(collection) {
-			if isFunc(closure) &&
-				closure.NumOut() == 1 &&
-				closure.NumIn() == 1 && isInterface(closure.In(0)) {
+		if isFunc(closure) &&
+			closure.NumOut() == 1 &&
+			closure.NumIn() == 1 && isInterface(closure.In(0)) {
 
-				return reflect.ArrayOf(0, closure.Out(0))
-
-			}
-			panic(v.error(node.Arguments[1], "closure should return bool"))
+			return reflect.SliceOf(closure.Out(0))
 		}
-		panic(v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection))
+		return v.error(node.Arguments[1], "closure should has one input and one output param")
+
+	case "count":
+		collection := v.visit(node.Arguments[0])
+		if !isArray(collection) {
+			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection)
+		}
+
+		v.collections = append(v.collections, collection)
+		closure := v.visit(node.Arguments[1])
+		v.collections = v.collections[:len(v.collections)-1]
+
+		if isFunc(closure) &&
+			closure.NumOut() == 1 &&
+			closure.NumIn() == 1 && isInterface(closure.In(0)) {
+			if !isBool(closure.Out(0)) {
+				return v.error(node.Arguments[1], "closure should return boolean (got %v)", closure.Out(0).String())
+			}
+
+			return integerType
+		}
+		return v.error(node.Arguments[1], "closure should has one input and one output param")
 
 	default:
-		panic(v.error(node, "unknown builtin %v", node.Name))
+		return v.error(node, "unknown builtin %v", node.Name)
 	}
 }
 
@@ -512,18 +537,22 @@ func (v *visitor) ClosureNode(node *ast.ClosureNode) reflect.Type {
 }
 
 func (v *visitor) PointerNode(node *ast.PointerNode) reflect.Type {
+	if len(v.collections) == 0 {
+		return v.error(node, "cannot use pointer accessor outside closure")
+	}
+
 	collection := v.collections[len(v.collections)-1]
 
 	if t, ok := indexType(collection); ok {
 		return t
 	}
-	panic(v.error(node, "cannot use %v as array", collection))
+	return v.error(node, "cannot use %v as array", collection)
 }
 
 func (v *visitor) ConditionalNode(node *ast.ConditionalNode) reflect.Type {
 	c := v.visit(node.Cond)
 	if !isBool(c) {
-		panic(v.error(node.Cond, "non-bool expression (type %v) used as condition", c))
+		return v.error(node.Cond, "non-bool expression (type %v) used as condition", c)
 	}
 
 	t1 := v.visit(node.Exp1)
